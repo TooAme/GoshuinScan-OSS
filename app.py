@@ -7,16 +7,22 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 import torch
+from PIL import Image, ImageTk
 
 from processor import GoshuinProcessor, ProcessResult
+
+if hasattr(Image, "Resampling"):
+    _RESAMPLE_LANCZOS = Image.Resampling.LANCZOS
+else:  # pragma: no cover - Pillow backward compatibility
+    _RESAMPLE_LANCZOS = Image.LANCZOS
 
 
 class GoshuinScanApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("GoshuinScan-OSS")
-        self.root.geometry("900x560")
-        self.root.minsize(780, 460)
+        self.root.geometry("980x700")
+        self.root.minsize(860, 560)
 
         self.image_path_var = tk.StringVar()
         self.output_dir_var = tk.StringVar(value=str((Path.cwd() / "outputs").resolve()))
@@ -24,6 +30,13 @@ class GoshuinScanApp:
 
         self._event_queue: queue.Queue = queue.Queue()
         self._processing = False
+        self._preview_labels: dict[str, ttk.Label] = {}
+        self._preview_images: dict[str, Image.Image | None] = {
+            "input": None,
+            "enhanced": None,
+            "transparent": None,
+        }
+        self._preview_photo_refs: dict[str, ImageTk.PhotoImage] = {}
 
         self._build_ui()
         self.root.after(100, self._poll_events)
@@ -37,7 +50,7 @@ class GoshuinScanApp:
 
         subtitle = ttk.Label(
             container,
-            text="処理フロー: docTR ドキュメント補正 -> RMBG-2.0 前景抽出 (黒墨/朱印保持)",
+            text="処理フロー: 視角補正 (RMBG) -> docTR 補正 -> 背景除去 (黒墨/朱印保持)",
         )
         subtitle.pack(anchor=tk.W, pady=(2, 12))
 
@@ -77,6 +90,42 @@ class GoshuinScanApp:
         self.progress = ttk.Progressbar(actions_frame, mode="indeterminate", length=180)
         self.progress.pack(side=tk.LEFT, padx=(12, 0))
 
+        preview_frame = ttk.LabelFrame(container, text="プレビュー", padding=8)
+        preview_frame.pack(fill=tk.BOTH, expand=True, pady=(14, 0))
+        preview_frame.columnconfigure(0, weight=1)
+        preview_frame.rowconfigure(0, weight=1)
+        preview_frame.configure(height=300)
+        preview_frame.grid_propagate(False)
+
+        preview_content = ttk.Frame(preview_frame)
+        preview_content.grid(row=0, column=0, sticky=tk.NSEW)
+        preview_content.columnconfigure(0, weight=1)
+        preview_content.columnconfigure(1, weight=1)
+        preview_content.columnconfigure(2, weight=1)
+        preview_content.rowconfigure(0, weight=1)
+
+        self._create_preview_panel(
+            parent=preview_content,
+            key="input",
+            title="入力画像",
+            placeholder="画像を選択してください。",
+            column=0,
+        )
+        self._create_preview_panel(
+            parent=preview_content,
+            key="enhanced",
+            title="補正画像",
+            placeholder="処理後の補正画像がここに表示されます。",
+            column=1,
+        )
+        self._create_preview_panel(
+            parent=preview_content,
+            key="transparent",
+            title="透過画像",
+            placeholder="処理後の透過画像がここに表示されます。",
+            column=2,
+        )
+
         log_frame = ttk.LabelFrame(container, text="ログ", padding=8)
         log_frame.pack(fill=tk.BOTH, expand=True, pady=(14, 0))
         log_frame.columnconfigure(0, weight=1)
@@ -99,6 +148,9 @@ class GoshuinScanApp:
         )
         if path:
             self.image_path_var.set(path)
+            self._update_preview_from_path("input", Path(path))
+            self._set_preview_placeholder("enhanced", "処理後の補正画像がここに表示されます。")
+            self._set_preview_placeholder("transparent", "処理後の透過画像がここに表示されます。")
 
     def _select_output_dir(self) -> None:
         path = filedialog.askdirectory(title="出力フォルダーを選択")
@@ -123,6 +175,7 @@ class GoshuinScanApp:
             messagebox.showerror("入力エラー", "出力フォルダーを選択してください。")
             return
 
+        self._update_preview_from_path("input", image_path)
         self._set_processing(True)
         self._append_log(f"処理開始: {image_path}")
 
@@ -167,6 +220,13 @@ class GoshuinScanApp:
         self._append_log("処理が完了しました。")
         self._append_log(f"補正画像: {result.enhanced_path}")
         self._append_log(f"透過画像: {result.transparent_path}")
+        
+        self._update_preview_from_path("enhanced", result.enhanced_path)
+        self._update_preview_from_path("transparent", result.transparent_path)
+        
+        # 強制的にUIを更新して、ダイアログ表示前にプレビューを描画させる
+        self.root.update_idletasks()
+        
         messagebox.showinfo(
             "完了",
             (
@@ -189,6 +249,73 @@ class GoshuinScanApp:
         else:
             self.process_button.configure(state=tk.NORMAL)
             self.progress.stop()
+
+    def _create_preview_panel(
+        self,
+        parent: ttk.Frame,
+        key: str,
+        title: str,
+        placeholder: str,
+        column: int,
+    ) -> None:
+        panel = ttk.LabelFrame(parent, text=title, padding=6)
+        panel.grid(row=0, column=column, sticky=tk.NSEW, padx=4)
+        panel.columnconfigure(0, weight=1)
+        panel.rowconfigure(0, weight=1)
+
+        preview_label = ttk.Label(panel, anchor=tk.CENTER, justify=tk.CENTER)
+        preview_label.grid(row=0, column=0, sticky=tk.NSEW)
+        preview_label.bind("<Configure>", lambda _event, image_key=key: self._render_preview(image_key))
+        self._preview_labels[key] = preview_label
+        self._set_preview_placeholder(key, placeholder)
+
+    def _set_preview_placeholder(self, key: str, message: str) -> None:
+        label = self._preview_labels[key]
+        self._preview_images[key] = None
+        self._preview_photo_refs.pop(key, None)
+        label.configure(image="", text=message, wraplength=520)
+
+    def _update_preview_from_path(self, key: str, path: Path) -> None:
+        try:
+            with Image.open(path) as pil_image:
+                if key == "transparent":
+                    loaded = pil_image.convert("RGBA")
+                else:
+                    loaded = pil_image.convert("RGB")
+        except Exception as exc:
+            self._set_preview_placeholder(key, f"プレビューの読み込みに失敗しました。\n{exc}")
+            return
+
+        self._preview_images[key] = loaded
+        self._render_preview(key, force=True)
+
+    def _render_preview(self, key: str, force: bool = False) -> None:
+        label = self._preview_labels[key]
+        source_image = self._preview_images.get(key)
+        if source_image is None:
+            return
+
+        w, h = label.winfo_width(), label.winfo_height()
+
+        # ウィンドウがまだ描画されていない場合はリトライ
+        if w <= 10 or h <= 10:
+            self.root.after(60, lambda image_key=key: self._render_preview(image_key, force=force))
+            return
+
+        target_width = max(w - 16, 1)
+        target_height = max(h - 16, 1)
+
+        # 画面リサイズ等の場合、現在の画像のサイズと目標サイズを比較し無駄な再描画を防ぐ
+        if not force:
+            current_tk = self._preview_photo_refs.get(key)
+            if current_tk and abs(current_tk.width() - target_width) < 10 and abs(current_tk.height() - target_height) < 10:
+                return
+
+        preview = source_image.copy()
+        preview.thumbnail((target_width, target_height), _RESAMPLE_LANCZOS)
+        preview_tk = ImageTk.PhotoImage(preview)
+        self._preview_photo_refs[key] = preview_tk
+        label.configure(image=preview_tk, text="")
 
     def _append_log(self, message: str) -> None:
         self.log_text.configure(state=tk.NORMAL)
