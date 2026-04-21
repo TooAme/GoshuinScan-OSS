@@ -6,7 +6,7 @@ AI-Powered Digital Archiving Tool for Goshuin (御朱印)
 ## Features
 Process Goshuin photos easily using a Python GUI:
 1. **Single Image / Folder Batch Processing**: You can select either one image or an input folder. If a folder is selected, all supported images in that folder are processed automatically.
-2. **Perspective Correction and Cropping**: Uses RMBG-2.0 to detect page contours and automatically corrects 3D perspective distortions to extract a perfectly flat rectangular page.
+2. **Geometric Rectification (UVDoc)**: Uses PaddleOCR's UVDoc module to correct tilt/perspective distortion (with automatic fallback to the legacy RMBG-based correction when UVDoc fails).
 3. **Document Enhancement**: Combines docTR with classic algorithms (CLAHE and unsharp masking) to fix remaining minor alignment issues and boost contrast.
 4. **Background Removal & Ink Extraction**: Re-applies RMBG-2.0 combined with global and adaptive thresholding to precisely isolate red stamps and black brush strokes, outputting a highly accurate transparent PNG.
 
@@ -26,7 +26,25 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-> The script will download docTR and RMBG-2.0 model weights upon first run. Ensure you have a stable internet connection.
+> The script will download UVDoc / docTR / RMBG-2.0 model weights on first run. Ensure you have a stable internet connection.
+
+## PaddlePaddle (Required by UVDoc)
+In addition to `paddleocr`, you must install `paddlepaddle` / `paddlepaddle-gpu`.
+
+Example (GPU):
+
+```powershell
+python -m pip install paddlepaddle-gpu==3.2.0 -i https://www.paddlepaddle.org.cn/packages/stable/cu126/
+```
+
+> For Windows + NVIDIA 50-series GPUs, follow the official special wheel guidance:  
+> https://www.paddleocr.ai/v3.3.0/en/version3.x/installation.html
+
+If your environment cannot reach Hugging Face, switch Paddle model source to BOS:
+
+```powershell
+$env:PADDLE_PDX_MODEL_SOURCE = "BOS"
+```
 
 ## Usage
 ```bash
@@ -82,5 +100,5 @@ $env:RMBG_MODEL_ID = "briaai/RMBG-1.4"
 Supported file extensions: `.jpg .jpeg .png .bmp .webp .tif .tiff`
 
 After processing is complete, the following files will be generated in your output directory:
-- `*_enhanced_doctr.png`: The flattened, perspective-corrected and enhanced image.
+- `*_enhanced_doctr.png`: UVDoc-rectified + docTR-enhanced image.
 - `*_ink_stamp_transparent.png`: A transparent PNG retaining only the black brush ink and red stamps.

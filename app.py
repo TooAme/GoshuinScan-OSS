@@ -62,8 +62,8 @@ class GoshuinScanApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("GoshuinScan-OSS")
-        self.root.geometry("980x700")
-        self.root.minsize(860, 560)
+        self.root.geometry("1460x860")
+        self.root.minsize(1240, 700)
 
         self.image_path_var = tk.StringVar()
         self.folder_path_var = tk.StringVar()
@@ -88,17 +88,28 @@ class GoshuinScanApp:
     def _build_ui(self) -> None:
         container = ttk.Frame(self.root, padding=14)
         container.pack(fill=tk.BOTH, expand=True)
+        container.columnconfigure(0, weight=3)
+        container.columnconfigure(1, weight=2)
+        container.rowconfigure(0, weight=1)
 
-        title = ttk.Label(container, text="御朱印画像処理ツール", font=("Segoe UI", 14, "bold"))
+        left_panel = ttk.Frame(container)
+        left_panel.grid(row=0, column=0, sticky=tk.NSEW, padx=(0, 10))
+
+        right_panel = ttk.Frame(container)
+        right_panel.grid(row=0, column=1, sticky=tk.NSEW)
+        right_panel.columnconfigure(0, weight=1)
+        right_panel.rowconfigure(0, weight=1)
+
+        title = ttk.Label(left_panel, text="御朱印画像処理ツール", font=("Segoe UI", 14, "bold"))
         title.pack(anchor=tk.W)
 
         subtitle = ttk.Label(
-            container,
-            text="処理フロー: 視角補正 (RMBG) -> docTR 補正 -> 背景除去 (黒墨/朱印保持)",
+            left_panel,
+            text="処理フロー: UVDoc 幾何補正 -> docTR 補正 -> 背景除去 (黒墨/朱印保持)",
         )
         subtitle.pack(anchor=tk.W, pady=(2, 12))
 
-        input_frame = ttk.LabelFrame(container, text="入力", padding=10)
+        input_frame = ttk.LabelFrame(left_panel, text="入力", padding=10)
         input_frame.pack(fill=tk.X)
         input_frame.columnconfigure(1, weight=1)
 
@@ -131,7 +142,7 @@ class GoshuinScanApp:
             text="※ 画像フォルダーを指定した場合は、フォルダー内の画像を一括処理します。",
         ).grid(row=3, column=0, columnspan=3, sticky=tk.W, pady=(2, 0))
 
-        options_frame = ttk.Frame(container)
+        options_frame = ttk.Frame(left_panel)
         options_frame.pack(fill=tk.X, pady=(10, 0))
         ttk.Checkbutton(
             options_frame,
@@ -144,7 +155,7 @@ class GoshuinScanApp:
             variable=self.use_ai_var,
         ).pack(side=tk.LEFT, padx=(24, 0))
 
-        actions_frame = ttk.Frame(container)
+        actions_frame = ttk.Frame(left_panel)
         actions_frame.pack(fill=tk.X, pady=(12, 0))
         self.process_button = ttk.Button(actions_frame, text="処理開始", command=self._start_process)
         self.process_button.pack(side=tk.LEFT)
@@ -152,7 +163,7 @@ class GoshuinScanApp:
         self.progress = ttk.Progressbar(actions_frame, mode="indeterminate", length=180)
         self.progress.pack(side=tk.LEFT, padx=(12, 0))
 
-        preview_frame = ttk.LabelFrame(container, text="プレビュー", padding=8)
+        preview_frame = ttk.LabelFrame(left_panel, text="プレビュー", padding=8)
         preview_frame.pack(fill=tk.BOTH, expand=True, pady=(14, 0))
         preview_frame.columnconfigure(0, weight=1)
         preview_frame.rowconfigure(0, weight=1)
@@ -189,7 +200,7 @@ class GoshuinScanApp:
         )
 
         # AI 識別結果パネル
-        ai_frame = ttk.LabelFrame(container, text="AI 識別結果 (LoRA)", padding=8)
+        ai_frame = ttk.LabelFrame(left_panel, text="AI 識別結果 (LoRA)", padding=8)
         ai_frame.pack(fill=tk.X, pady=(10, 0))
         ai_frame.columnconfigure(0, weight=1)
         ai_frame.columnconfigure(1, weight=1)
@@ -210,8 +221,8 @@ class GoshuinScanApp:
             val_label.pack(anchor=tk.W)
             self._ai_labels[key] = val_label
 
-        log_frame = ttk.LabelFrame(container, text="ログ", padding=8)
-        log_frame.pack(fill=tk.BOTH, expand=True, pady=(14, 0))
+        log_frame = ttk.LabelFrame(right_panel, text="ログ", padding=8)
+        log_frame.grid(row=0, column=0, sticky=tk.NSEW)
         log_frame.columnconfigure(0, weight=1)
         log_frame.rowconfigure(0, weight=1)
 

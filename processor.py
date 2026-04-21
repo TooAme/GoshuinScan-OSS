@@ -4,7 +4,7 @@ import os
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 import cv2
 import numpy as np
@@ -14,6 +14,14 @@ from huggingface_hub.utils import HfHubHTTPError
 from PIL import Image
 from torchvision import transforms
 from transformers import AutoModelForImageSegmentation
+
+try:
+    from paddleocr import TextImageUnwarping
+
+    _PADDLEOCR_IMPORT_ERROR: Optional[Exception] = None
+except Exception as exc:  # pragma: no cover - runtime dependency check
+    TextImageUnwarping = None
+    _PADDLEOCR_IMPORT_ERROR = exc
 
 try:
     from doctr.io import DocumentFile
@@ -42,6 +50,7 @@ class GoshuinProcessor:
         self._log_callback = log_callback or (lambda _msg: None)
 
         self._doctr_predictor = None
+        self._uvdoc_model = None
         self._rmbg_model = None
         self._rmbg_transform = transforms.Compose(
             [
@@ -61,9 +70,21 @@ class GoshuinProcessor:
         if source is None:
             raise ValueError(f"画像を読み込めません: {image_path}")
 
-        self._log("ステップ 1/3: 視角の補正と切り抜き (RMBG)")
-        initial_mask = self._predict_foreground_mask(source)
-        source = self._perspective_correction(source, initial_mask)
+        self._log("ステップ 1/3: UVDoc 幾何補正")
+        try:
+            source = self._uvdoc_geometric_correction(source)
+            self._log("UVDoc による幾何補正が完了しました。")
+        except Exception as exc:
+            details = self._collect_exception_text(exc)
+            hint = self._build_uvdoc_hint(details)
+            if hint:
+                details = f"{details}\n{hint}"
+            self._log(
+                "UVDoc 補正に失敗したため、従来の RMBG パース補正にフォールバックします。\n"
+                f"詳細: {details}"
+            )
+            initial_mask = self._predict_foreground_mask(source)
+            source = self._perspective_correction(source, initial_mask)
 
         self._log("ステップ 2/3: docTR ドキュメント補正")
         enhanced = self._doctr_document_enhancement(source)
@@ -92,6 +113,144 @@ class GoshuinProcessor:
 
     def _log(self, message: str) -> None:
         self._log_callback(message)
+
+    def _load_uvdoc_model(self):
+        if self._uvdoc_model is not None:
+            return self._uvdoc_model
+        if TextImageUnwarping is None:
+            import_error_text = str(_PADDLEOCR_IMPORT_ERROR) if _PADDLEOCR_IMPORT_ERROR else "不明な import エラー"
+            raise RuntimeError(
+                "UVDoc (PaddleOCR) が利用できません。\n"
+                f"原因: {import_error_text}\n"
+                "対処: `pip install paddleocr` と `pip install paddlepaddle`（または `paddlepaddle-gpu`）を実行してください。"
+            ) from _PADDLEOCR_IMPORT_ERROR
+
+        model = None
+        model_options = [
+            {"model_name": "UVDoc", "device": "gpu" if self.device == "cuda" else "cpu"},
+            {"model_name": "UVDoc"},
+        ]
+        last_exc: Optional[Exception] = None
+        for kwargs in model_options:
+            try:
+                model = TextImageUnwarping(**kwargs)
+                break
+            except TypeError as exc:
+                last_exc = exc
+                continue
+            except Exception as exc:
+                # Some versions may reject `device`; retry with minimal args.
+                last_exc = exc
+                if "device" in kwargs:
+                    continue
+                raise
+
+        if model is None:
+            details = self._collect_exception_text(last_exc) if last_exc else "不明な初期化エラー"
+            raise RuntimeError(f"UVDoc モデルの初期化に失敗しました。詳細: {details}") from last_exc
+
+        self._uvdoc_model = model
+        return model
+
+    def _uvdoc_geometric_correction(self, image: np.ndarray) -> np.ndarray:
+        model = self._load_uvdoc_model()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            input_path = temp_root / "uvdoc_input.png"
+            output_dir = temp_root / "uvdoc_output"
+            output_dir.mkdir(parents=True, exist_ok=True)
+            self._write_image_unicode(input_path, image)
+
+            try:
+                results = model.predict(str(input_path), batch_size=1)
+            except TypeError:
+                results = model.predict(str(input_path))
+
+            result_item = None
+            for item in results:
+                result_item = item
+                break
+
+            if result_item is None:
+                raise RuntimeError("UVDoc から有効な推論結果が得られませんでした。")
+
+            if hasattr(result_item, "save_to_img"):
+                try:
+                    result_item.save_to_img(save_path=str(output_dir))
+                    saved_path = self._find_first_image_file(output_dir)
+                    if saved_path is not None:
+                        saved = self._read_image_unicode(saved_path, cv2.IMREAD_COLOR)
+                        if saved is not None:
+                            return saved
+                except Exception:
+                    pass
+
+            extracted = self._extract_image_from_uvdoc_result(result_item)
+            if extracted is not None:
+                return extracted
+
+            raise RuntimeError("UVDoc の出力画像を復元できませんでした。")
+
+    @staticmethod
+    def _find_first_image_file(root: Path) -> Optional[Path]:
+        extensions = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
+        for path in sorted(root.rglob("*")):
+            if path.is_file() and path.suffix.lower() in extensions:
+                return path
+        return None
+
+    @staticmethod
+    def _normalize_image_array(value: Any) -> Optional[np.ndarray]:
+        if value is None:
+            return None
+
+        array: Optional[np.ndarray]
+        if isinstance(value, np.ndarray):
+            array = value
+        elif hasattr(value, "numpy"):
+            try:
+                array = value.numpy()
+            except Exception:
+                return None
+        else:
+            return None
+
+        if array.ndim == 2:
+            array = cv2.cvtColor(array, cv2.COLOR_GRAY2BGR)
+        elif array.ndim == 3 and array.shape[2] == 4:
+            array = cv2.cvtColor(array, cv2.COLOR_BGRA2BGR)
+        elif array.ndim != 3:
+            return None
+
+        if array.dtype != np.uint8:
+            array = array.astype(np.float32)
+            max_val = float(array.max()) if array.size else 0.0
+            if max_val <= 1.0:
+                array = array * 255.0
+            array = np.clip(array, 0, 255).astype(np.uint8)
+
+        return array
+
+    @classmethod
+    def _extract_image_from_uvdoc_result(cls, result_item: Any) -> Optional[np.ndarray]:
+        candidates: list[Any] = [result_item]
+        if hasattr(result_item, "res"):
+            candidates.append(getattr(result_item, "res"))
+
+        for candidate in candidates:
+            normalized = cls._normalize_image_array(candidate)
+            if normalized is not None:
+                return normalized
+
+            if isinstance(candidate, dict):
+                for key in ("doctr_img", "output_img", "img", "image", "res", "result"):
+                    if key not in candidate:
+                        continue
+                    normalized = cls._normalize_image_array(candidate.get(key))
+                    if normalized is not None:
+                        return normalized
+
+        return None
 
     def _load_doctr_predictor(self):
         if self._doctr_predictor is not None:
@@ -266,6 +425,8 @@ class GoshuinProcessor:
 
     @staticmethod
     def _collect_exception_text(exc: Exception) -> str:
+        if exc is None:
+            return ""
         seen: set[int] = set()
         parts: list[str] = []
         stack: list[BaseException] = [exc]
@@ -287,6 +448,28 @@ class GoshuinProcessor:
                 stack.append(current.__context__)
 
         return "\n".join(parts)
+
+    @staticmethod
+    def _build_uvdoc_hint(details: str) -> str:
+        lowered = details.lower()
+
+        if "no module named 'paddleocr'" in lowered:
+            return "ヒント: `pip install paddleocr` を実行してから再試行してください。"
+        if "no module named 'paddle'" in lowered or "import paddle" in lowered:
+            return (
+                "ヒント: PaddlePaddle が未導入です。"
+                "`pip install paddlepaddle`（CPU）または `pip install paddlepaddle-gpu`（GPU）を実行してください。"
+            )
+        if "textimageunwarping" in lowered and "cannot import name" in lowered:
+            return "ヒント: PaddleOCR のバージョンが古い可能性があります。`pip install -U paddleocr` を実行してください。"
+        if "couldn't connect" in lowered or "failed to establish a new connection" in lowered:
+            return (
+                "ヒント: モデルダウンロード時のネットワーク接続に失敗しています。"
+                "必要なら `PADDLE_PDX_MODEL_SOURCE=BOS` を設定して再試行してください。"
+            )
+        if "permission denied" in lowered or "winerror 5" in lowered:
+            return "ヒント: 権限不足の可能性があります。管理者権限または書き込み可能な作業ディレクトリで実行してください。"
+        return ""
 
     def _doctr_document_enhancement(self, image: np.ndarray) -> np.ndarray:
         oriented = image

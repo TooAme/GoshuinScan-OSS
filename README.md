@@ -6,7 +6,7 @@
 ## 機能
 Python GUI を使用して御朱印の写真を処理します：
 1. **単画像 / フォルダー一括処理**：1 枚の画像または画像フォルダーを入力として選択でき、フォルダー選択時は中の対応画像を自動でまとめて処理します。
-2. **視角補正と切り抜き**：RMBG-2.0 を使用してページの輪郭を検出し、パース（傾きや立体的な歪み）を自動で補正して長方形に切り抜きます。
+2. **幾何補正（UVDoc）**：PaddleOCR の UVDoc モジュールを使用して、撮影時の傾き・パース歪みを補正します（失敗時は従来の RMBG ベース補正にフォールバック）。
 3. **ドキュメント補正**：docTR と古典的な画像補正アルゴリズム（CLAHE およびシャープネス）を組み合わせ、残りの微小な傾きを修正し、コントラストを強化します。
 4. **背景除去とインク抽出**：RMBG-2.0 を再度適用して背景を完璧に取り除き、適応的閾値（Adaptive Threshold）などで朱印（赤）と墨跡（黒）のみを保持した高精度な透過 PNG を出力します。
 
@@ -26,7 +26,25 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-> 初回実行時に docTR および RMBG-2.0 のモデル重みがダウンロードされるため、インターネット接続が必要です。
+> 初回実行時に UVDoc / docTR / RMBG-2.0 のモデル重みがダウンロードされるため、インターネット接続が必要です。
+
+## PaddlePaddle (UVDoc 実行に必須)
+`paddleocr` に加えて `paddlepaddle` / `paddlepaddle-gpu` の導入が必要です。
+
+例（GPU 環境）:
+
+```powershell
+python -m pip install paddlepaddle-gpu==3.2.0 -i https://www.paddlepaddle.org.cn/packages/stable/cu126/
+```
+
+> Windows + NVIDIA 50 シリーズ GPU は PaddleOCR 公式の専用 Wheel 案内を確認してください:  
+> https://www.paddleocr.ai/v3.3.0/en/version3.x/installation.html
+
+Hugging Face に接続できない環境では、Paddle モデル取得元を BOS に切替できます:
+
+```powershell
+$env:PADDLE_PDX_MODEL_SOURCE = "BOS"
+```
 
 ## 実行方法
 ```bash
@@ -82,5 +100,5 @@ $env:RMBG_MODEL_ID = "briaai/RMBG-1.4"
 対応拡張子: `.jpg .jpeg .png .bmp .webp .tif .tiff`
 
 処理が完了すると、指定した出力ディレクトリに以下のファイルが生成されます：
-- `*_enhanced_doctr.png`：視角およびドキュメント補正済みの画像
+- `*_enhanced_doctr.png`：UVDoc 幾何補正 + docTR 補正済みの画像
 - `*_ink_stamp_transparent.png`：黒墨と赤朱印のみを保持した透過背景 PNG
