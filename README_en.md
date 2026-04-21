@@ -5,9 +5,10 @@ AI-Powered Digital Archiving Tool for Goshuin (御朱印)
 
 ## Features
 Process Goshuin photos easily using a Python GUI:
-1. **Perspective Correction and Cropping**: Uses RMBG-2.0 to detect page contours and automatically corrects 3D perspective distortions to extract a perfectly flat rectangular page.
-2. **Document Enhancement**: Combines docTR with classic algorithms (CLAHE and unsharp masking) to fix remaining minor alignment issues and boost contrast.
-3. **Background Removal & Ink Extraction**: Re-applies RMBG-2.0 combined with global and adaptive thresholding to precisely isolate red stamps and black brush strokes, outputting a highly accurate transparent PNG.
+1. **Single Image / Folder Batch Processing**: You can select either one image or an input folder. If a folder is selected, all supported images in that folder are processed automatically.
+2. **Perspective Correction and Cropping**: Uses RMBG-2.0 to detect page contours and automatically corrects 3D perspective distortions to extract a perfectly flat rectangular page.
+3. **Document Enhancement**: Combines docTR with classic algorithms (CLAHE and unsharp masking) to fix remaining minor alignment issues and boost contrast.
+4. **Background Removal & Ink Extraction**: Re-applies RMBG-2.0 combined with global and adaptive thresholding to precisely isolate red stamps and black brush strokes, outputting a highly accurate transparent PNG.
 
 ## Requirements
 - Python 3.10+
@@ -30,6 +31,20 @@ pip install -r requirements.txt
 ## Usage
 ```bash
 python app.py
+```
+
+## LoRA Model Config (.env)
+If you want to use AI recognition (LoRA), configure paths in the project-root `.env` file.
+
+```powershell
+Copy-Item .env.example .env
+```
+
+Example `.env`:
+
+```env
+LORA_MODEL_PATH=K:\Qwen3-VL-4B-Instruct
+LORA_ADAPTER_PATH=K:\qwen3vl-train\output\goshuin_lora_v1
 ```
 
 ## Hugging Face Authentication (Required for RMBG-2.0)
@@ -57,10 +72,14 @@ $env:RMBG_MODEL_ID = "briaai/RMBG-1.4"
 ```
 
 ## How to Use the GUI
-1. Click `画像を選択` (Select Image) to choose a Goshuin photo.
-2. Click `フォルダー選択` (Select Folder) to choose the output directory.
-3. Optional: Check `GPU (CUDA) を使用` (Use GPU (CUDA)).
+1. Choose input (one of the following):
+   - `画像を選択` (Select Image) for single-image processing
+   - `画像フォルダー` -> `フォルダーを選択` for folder batch processing
+2. Choose output by `出力フォルダー` -> `フォルダーを選択`.
+3. Optional: enable `GPU (CUDA) を使用` and `AI 識別 (LoRA モデル)`.
 4. Click `処理開始` (Start Processing).
+
+Supported file extensions: `.jpg .jpeg .png .bmp .webp .tif .tiff`
 
 After processing is complete, the following files will be generated in your output directory:
 - `*_enhanced_doctr.png`: The flattened, perspective-corrected and enhanced image.
