@@ -8,7 +8,66 @@ Process Goshuin photos easily using a Python GUI:
 1. **Single Image / Folder Batch Processing**: You can select either one image or an input folder. If a folder is selected, all supported images in that folder are processed automatically.
 2. **Geometric Rectification (UVDoc)**: Uses PaddleOCR's UVDoc module to correct tilt/perspective distortion (with automatic fallback to the legacy RMBG-based correction when UVDoc fails).
 3. **Document Enhancement**: Combines docTR with classic algorithms (CLAHE and unsharp masking) to fix remaining minor alignment issues and boost contrast.
-4. **Background Removal & Ink Extraction**: Re-applies RMBG-2.0 combined with global and adaptive thresholding to precisely isolate red stamps and black brush strokes, outputting a highly accurate transparent PNG.
+4. **Background Removal & Ink Extraction**: Combines RMBG-2.0 foreground masking with `GoshuinSensoryExtractor` to remove Washi-like background and output transparent PNG.
+5. **Keep-Color Selection (Single Image Only)**: After selecting one image, the app extracts color bands and preselects black-ink/red-stamp-like colors by default. Toggling color blocks only affects final alpha composition and does not overwrite the input image.
+
+## Current Processing Flow
+```mermaid
+sequenceDiagram
+    autonumber
+
+    participant U as User (GUI)
+    participant A as app.py
+    participant P as processor.py (GoshuinProcessor)
+    participant UV as UVDoc (PaddleOCR)
+    participant DT as docTR
+    participant RB as RMBG-2.0
+    participant EX as GoshuinSensoryExtractor
+    participant AI as Qwen3-VL + LoRA
+    participant FS as Output Disk
+
+    U->>A: Select input (single image or folder)
+    alt Single image
+        A->>A: Extract color-band options
+        A->>A: Preselect black/red-like colors
+        U->>A: Adjust keep-color blocks (optional)
+    else Folder
+        A->>A: Enumerate supported images
+    end
+
+    U->>A: Click Start Processing
+    A->>P: process(image_path, output_dir, color_options, selected_color_ids)
+
+    loop For each image
+        P->>UV: Run geometric correction
+        alt UVDoc succeeds
+            UV-->>P: Rectified source
+        else UVDoc fails
+            P->>RB: Infer foreground mask (fallback)
+            RB-->>P: foreground mask
+            P->>P: Apply legacy perspective correction
+        end
+
+        P->>DT: Document enhancement + CLAHE/Sharpen
+        DT-->>P: enhanced image
+        P->>FS: Save *_enhanced_doctr.png
+
+        P->>RB: Infer foreground mask
+        RB-->>P: foreground mask
+        P->>EX: Extract ink/stamp mask
+        EX-->>P: ink_stamp mask
+        P->>P: alpha = foreground × ink_stamp
+        opt Single-image mode with keep-color selection
+            P->>P: Merge selected-color mask into alpha
+        end
+        P->>FS: Save *_ink_stamp_transparent.png
+
+        opt AI recognition enabled
+            A->>AI: Request image parsing
+            AI-->>A: name/date/text/mark
+        end
+    end
+```
 
 ## Requirements
 - Python 3.10+
@@ -94,11 +153,12 @@ $env:RMBG_MODEL_ID = "briaai/RMBG-1.4"
    - `画像を選択` (Select Image) for single-image processing
    - `画像フォルダー` -> `フォルダーを選択` for folder batch processing
 2. Choose output by `出力フォルダー` -> `フォルダーを選択`.
-3. Optional: enable `GPU (CUDA) を使用` and `AI 識別 (LoRA モデル)`.
-4. Click `処理開始` (Start Processing).
+3. For single-image mode, keep-color blocks appear automatically (black/red-like colors are preselected by default).
+4. Optional: enable `GPU (CUDA) を使用` and `AI 識別 (LoRA モデル)`.
+5. Click `処理開始` (Start Processing).
 
 Supported file extensions: `.jpg .jpeg .png .bmp .webp .tif .tiff`
 
 After processing is complete, the following files will be generated in your output directory:
 - `*_enhanced_doctr.png`: UVDoc-rectified + docTR-enhanced image.
-- `*_ink_stamp_transparent.png`: A transparent PNG retaining only the black brush ink and red stamps.
+- `*_ink_stamp_transparent.png`: Transparent PNG of extracted ink/stamp regions (plus user-selected keep-color regions, if any).

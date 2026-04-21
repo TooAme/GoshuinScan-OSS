@@ -9,7 +9,6 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Any, Optional
 
-import cv2
 import numpy as np
 import torch
 from PIL import Image, ImageTk
@@ -17,7 +16,6 @@ from PIL import Image, ImageTk
 from processor import (
     GoshuinProcessor,
     ProcessResult,
-    build_selected_color_mask,
     extract_goshuin_color_options,
 )
 
@@ -59,6 +57,8 @@ _SUPPORTED_IMAGE_EXTENSIONS = {
     ".tif",
     ".tiff",
 }
+_MAIN_PREVIEW_PANEL_WIDTH = 250
+_MAIN_PREVIEW_PANEL_HEIGHT = 250
 
 if hasattr(Image, "Resampling"):
     _RESAMPLE_LANCZOS = Image.Resampling.LANCZOS
@@ -92,11 +92,13 @@ class GoshuinScanApp:
         self._color_options: list[dict[str, Any]] = []
         self._selected_color_ids: set[int] = set()
         self._color_buttons: dict[int, tk.Button] = {}
+        self._color_button_frames: dict[int, tk.Frame] = {}
         self._color_palette_container: Optional[tk.Frame] = None
         self._color_palette_hint_var = tk.StringVar(value="画像を選択すると色域候補が表示されます。")
         self._color_preview_source = None
-        self._manual_input_override = None
-        self._processing_manual_input = False
+        self._log_window: Optional[tk.Toplevel] = None
+        self._log_text_widget: Optional[tk.Text] = None
+        self._log_lines: list[str] = []
 
         self._build_ui()
         self.root.after(100, self._poll_events)
@@ -104,58 +106,57 @@ class GoshuinScanApp:
     def _build_ui(self) -> None:
         container = ttk.Frame(self.root, padding=14)
         container.pack(fill=tk.BOTH, expand=True)
-        container.columnconfigure(0, weight=3)
-        container.columnconfigure(1, weight=2)
+        container.columnconfigure(0, weight=1)
         container.rowconfigure(0, weight=1)
 
-        left_panel = ttk.Frame(container)
+        top_area = ttk.Frame(container)
+        top_area.grid(row=0, column=0, sticky=tk.NSEW)
+        top_area.columnconfigure(0, weight=2)
+        top_area.columnconfigure(1, weight=3)
+        top_area.rowconfigure(0, weight=1)
+
+        left_panel = ttk.Frame(top_area)
         left_panel.grid(row=0, column=0, sticky=tk.NSEW, padx=(0, 10))
 
-        right_panel = ttk.Frame(container)
+        right_panel = ttk.Frame(top_area)
         right_panel.grid(row=0, column=1, sticky=tk.NSEW)
         right_panel.columnconfigure(0, weight=1)
-        right_panel.rowconfigure(0, weight=1)
+        right_panel.rowconfigure(0, weight=4)
+        right_panel.rowconfigure(1, weight=1)
 
         title = ttk.Label(left_panel, text="御朱印画像処理ツール", font=("Segoe UI", 14, "bold"))
         title.pack(anchor=tk.W)
 
         subtitle = ttk.Label(
             left_panel,
-            text="処理フロー: UVDoc 幾何補正 -> docTR 補正 -> 背景除去 (黒墨/朱印保持)",
+            text="処理フロー: UVDoc 幾何補正 -> docTR 補正 -> 背景除去",
         )
-        subtitle.pack(anchor=tk.W, pady=(2, 12))
+        subtitle.pack(anchor=tk.W, pady=(2, 10))
 
-        input_frame = ttk.LabelFrame(left_panel, text="入力", padding=10)
+        input_frame = ttk.LabelFrame(left_panel, text="入力/出力", padding=10)
         input_frame.pack(fill=tk.X)
         input_frame.columnconfigure(1, weight=1)
 
         ttk.Label(input_frame, text="画像:").grid(row=0, column=0, sticky=tk.W, padx=(0, 8), pady=4)
-        image_entry = ttk.Entry(input_frame, textvariable=self.image_path_var)
-        image_entry.grid(row=0, column=1, sticky=tk.EW, pady=4)
+        ttk.Entry(input_frame, textvariable=self.image_path_var).grid(row=0, column=1, sticky=tk.EW, pady=4)
         ttk.Button(input_frame, text="画像を選択", command=self._select_image).grid(
             row=0, column=2, sticky=tk.W, padx=(8, 0), pady=4
         )
 
-        ttk.Label(input_frame, text="画像フォルダー:").grid(
-            row=1, column=0, sticky=tk.W, padx=(0, 8), pady=4
-        )
-        folder_entry = ttk.Entry(input_frame, textvariable=self.folder_path_var)
-        folder_entry.grid(row=1, column=1, sticky=tk.EW, pady=4)
+        ttk.Label(input_frame, text="画像フォルダー:").grid(row=1, column=0, sticky=tk.W, padx=(0, 8), pady=4)
+        ttk.Entry(input_frame, textvariable=self.folder_path_var).grid(row=1, column=1, sticky=tk.EW, pady=4)
         ttk.Button(input_frame, text="フォルダーを選択", command=self._select_input_dir).grid(
             row=1, column=2, sticky=tk.W, padx=(8, 0), pady=4
         )
 
-        ttk.Label(input_frame, text="出力フォルダー:").grid(
-            row=2, column=0, sticky=tk.W, padx=(0, 8), pady=4
-        )
-        output_entry = ttk.Entry(input_frame, textvariable=self.output_dir_var)
-        output_entry.grid(row=2, column=1, sticky=tk.EW, pady=4)
+        ttk.Label(input_frame, text="出力フォルダー:").grid(row=2, column=0, sticky=tk.W, padx=(0, 8), pady=4)
+        ttk.Entry(input_frame, textvariable=self.output_dir_var).grid(row=2, column=1, sticky=tk.EW, pady=4)
         ttk.Button(input_frame, text="フォルダーを選択", command=self._select_output_dir).grid(
             row=2, column=2, sticky=tk.W, padx=(8, 0), pady=4
         )
         ttk.Label(
             input_frame,
-            text="※ 画像フォルダーを指定した場合は、フォルダー内の画像を一括処理します。",
+            text="※ フォルダー指定時は一括処理。単画像時のみ色域選択を適用。",
         ).grid(row=3, column=0, columnspan=3, sticky=tk.W, pady=(2, 0))
 
         color_frame = ttk.LabelFrame(left_panel, text="保持色の選択", padding=8)
@@ -184,20 +185,30 @@ class GoshuinScanApp:
 
         self.progress = ttk.Progressbar(actions_frame, mode="indeterminate", length=180)
         self.progress.pack(side=tk.LEFT, padx=(12, 0))
+        self.log_button = ttk.Button(actions_frame, text="ログを開く", command=self._open_log_window)
+        self.log_button.pack(side=tk.LEFT, padx=(12, 0))
 
-        preview_frame = ttk.LabelFrame(left_panel, text="プレビュー", padding=8)
-        preview_frame.pack(fill=tk.BOTH, expand=True, pady=(14, 0))
-        preview_frame.columnconfigure(0, weight=1)
-        preview_frame.rowconfigure(0, weight=1)
-        preview_frame.configure(height=300)
+        preview_frame = ttk.LabelFrame(right_panel, text="画像表示", padding=8)
+        preview_frame.grid(row=0, column=0, sticky=tk.NW)
+        preview_frame.configure(
+            width=(_MAIN_PREVIEW_PANEL_WIDTH * 3) + 34,
+            height=_MAIN_PREVIEW_PANEL_HEIGHT + 46,
+        )
         preview_frame.grid_propagate(False)
+        preview_frame.columnconfigure(0, weight=0)
+        preview_frame.rowconfigure(0, weight=0)
 
         preview_content = ttk.Frame(preview_frame)
-        preview_content.grid(row=0, column=0, sticky=tk.NSEW)
-        preview_content.columnconfigure(0, weight=1)
-        preview_content.columnconfigure(1, weight=1)
-        preview_content.columnconfigure(2, weight=1)
-        preview_content.rowconfigure(0, weight=1)
+        preview_content.grid(row=0, column=0, sticky=tk.NW)
+        preview_content.configure(
+            width=(_MAIN_PREVIEW_PANEL_WIDTH * 3) + 18,
+            height=_MAIN_PREVIEW_PANEL_HEIGHT + 16,
+        )
+        preview_content.grid_propagate(False)
+        preview_content.columnconfigure(0, weight=0)
+        preview_content.columnconfigure(1, weight=0)
+        preview_content.columnconfigure(2, weight=0)
+        preview_content.rowconfigure(0, weight=0)
 
         self._create_preview_panel(
             parent=preview_content,
@@ -221,9 +232,8 @@ class GoshuinScanApp:
             column=2,
         )
 
-        # AI 識別結果パネル
-        ai_frame = ttk.LabelFrame(left_panel, text="AI 識別結果 (LoRA)", padding=8)
-        ai_frame.pack(fill=tk.X, pady=(10, 0))
+        ai_frame = ttk.LabelFrame(right_panel, text="解析結果 (LoRA)", padding=8)
+        ai_frame.grid(row=1, column=0, sticky=tk.NSEW, pady=(10, 0))
         ai_frame.columnconfigure(0, weight=1)
         ai_frame.columnconfigure(1, weight=1)
         ai_frame.columnconfigure(2, weight=1)
@@ -239,21 +249,9 @@ class GoshuinScanApp:
             cell = ttk.Frame(ai_frame)
             cell.grid(row=0, column=col, sticky=tk.EW, padx=6)
             ttk.Label(cell, text=display, font=("Segoe UI", 8), foreground="gray").pack(anchor=tk.W)
-            val_label = ttk.Label(cell, text="--", font=("Segoe UI", 10, "bold"), wraplength=200, justify=tk.LEFT)
+            val_label = ttk.Label(cell, text="--", font=("Segoe UI", 10, "bold"), wraplength=220, justify=tk.LEFT)
             val_label.pack(anchor=tk.W)
             self._ai_labels[key] = val_label
-
-        log_frame = ttk.LabelFrame(right_panel, text="ログ", padding=8)
-        log_frame.grid(row=0, column=0, sticky=tk.NSEW)
-        log_frame.columnconfigure(0, weight=1)
-        log_frame.rowconfigure(0, weight=1)
-
-        self.log_text = tk.Text(log_frame, wrap=tk.WORD, state=tk.DISABLED, font=("Consolas", 10))
-        self.log_text.grid(row=0, column=0, sticky=tk.NSEW)
-
-        scroll = ttk.Scrollbar(log_frame, orient=tk.VERTICAL, command=self.log_text.yview)
-        scroll.grid(row=0, column=1, sticky=tk.NS)
-        self.log_text.configure(yscrollcommand=scroll.set)
 
     def _select_image(self) -> None:
         path = filedialog.askopenfilename(
@@ -307,13 +305,80 @@ class GoshuinScanApp:
         b, g, r = [int(x) for x in color_bgr[:3]]
         return f"#{r:02x}{g:02x}{b:02x}"
 
+    @staticmethod
+    def _pick_default_keep_color_ids(color_options: list[dict[str, Any]]) -> set[int]:
+        black_candidates: list[tuple[float, int]] = []
+        red_candidates: list[tuple[float, int]] = []
+
+        for option in color_options:
+            color_id = int(option.get("id", -1))
+            bgr = option.get("bgr")
+            if color_id < 0 or not isinstance(bgr, list) or len(bgr) < 3:
+                continue
+
+            b, g, r = [int(np.clip(v, 0, 255)) for v in bgr[:3]]
+            ratio = float(option.get("ratio", 0.0))
+            is_background = bool(option.get("is_background", False))
+            if is_background:
+                continue
+
+            # 輝度(Value)と彩度(Saturation)の計算
+            v_max = max(r, g, b)
+            v_min = min(r, g, b)
+            sat = v_max - v_min
+
+            # 1. 金粉・背景色の除外ロジック (Gold/Yellowish Background Filter)
+            # 御朱印の和紙に含まれる金粉や黄ばみを除去するためのフィルター
+            # 金色は通常 R > G > B かつ B が極端に低い特性を持つ
+            is_gold_noise = (r > 130 and g > 110 and b < 110)
+            
+            # 2. 墨書き（黒色系）の判定 (Ink/Black Candidates)
+            # 明度が低ければ、多少の彩度（茶色寄り）も許容して掠れを保持する
+            if v_max <= 140 and not is_gold_noise:
+                # 彩度が低いほど純粋な黒に近いと判定
+                black_score = (140 - v_max) * 2.0 + (80 - sat) * 0.5 + ratio * 120.0
+                # 褐色残渣を防ぐため、Rが極端に高い場合はスコアを減らす
+                if r > b + 30:
+                    black_score -= 40
+                
+                if black_score > 0:
+                    black_candidates.append((black_score, color_id))
+
+            # 3. 朱印（赤色系）の判定 (Stamp/Red Candidates)
+            # R成分が支配的であるかを厳密にチェック
+            if r >= 70 and r > g and not is_gold_noise:
+                # 赤色の純度（Redness）を計算
+                redness = r - max(g, b)
+                if redness > 15:
+                    # 彩度と出現率を考慮したスコアリング
+                    red_score = redness * 2.5 + (r * 0.4) + ratio * 100.0
+                    # 背景の黄色（RとGが近い）との混同を避ける
+                    if abs(r - g) < 25:
+                        red_score -= 50
+                        
+                    if red_score > 0:
+                        red_candidates.append((red_score, color_id))
+
+        selected: set[int] = set()
+
+        if black_candidates:
+            black_candidates.sort(key=lambda x: x[0], reverse=True)
+            selected.add(black_candidates[0][1])
+
+        if red_candidates:
+            red_candidates.sort(key=lambda x: x[0], reverse=True)
+            for _score, color_id in red_candidates[:2]:
+                selected.add(color_id)
+
+        return selected
+
     def _clear_color_options(self, hint: str = "画像を選択すると色域候補が表示されます。") -> None:
         self._color_options = []
         self._selected_color_ids.clear()
         self._color_buttons.clear()
+        self._color_button_frames.clear()
         self._color_palette_hint_var.set(hint)
         self._color_preview_source = None
-        self._manual_input_override = None
         if self._color_palette_container is None:
             return
         for child in self._color_palette_container.winfo_children():
@@ -325,26 +390,38 @@ class GoshuinScanApp:
         for child in self._color_palette_container.winfo_children():
             child.destroy()
         self._color_buttons.clear()
+        self._color_button_frames.clear()
 
         if not self._color_options:
             return
 
+        unselected_border = self._color_palette_container.cget("bg")
         columns = 12
         for idx, option in enumerate(self._color_options):
             color_id = int(option["id"])
             color_hex = self._bgr_to_hex(option["bgr"])
-            button = tk.Button(
+            border = tk.Frame(
                 self._color_palette_container,
+                bg=unselected_border,
+                highlightthickness=0,
+                bd=0,
+            )
+            border.grid(row=idx // columns, column=idx % columns, padx=3, pady=3, sticky=tk.W)
+            button = tk.Button(
+                border,
                 width=2,
                 height=1,
                 bg=color_hex,
                 activebackground=color_hex,
-                relief=tk.SUNKEN if color_id in self._selected_color_ids else tk.RAISED,
-                bd=2,
+                relief=tk.FLAT,
+                bd=0,
+                highlightthickness=0,
                 command=lambda cid=color_id: self._toggle_color_selection(cid),
             )
-            button.grid(row=idx // columns, column=idx % columns, padx=3, pady=3, sticky=tk.W)
+            button.pack(padx=2, pady=2)
             self._color_buttons[color_id] = button
+            self._color_button_frames[color_id] = border
+        self._update_color_block_styles()
 
     def _toggle_color_selection(self, color_id: int) -> None:
         if color_id in self._selected_color_ids:
@@ -352,20 +429,21 @@ class GoshuinScanApp:
         else:
             self._selected_color_ids.add(color_id)
         self._update_color_block_styles()
-        self._update_live_alpha_preview()
 
     def _update_color_block_styles(self) -> None:
+        if self._color_palette_container is None:
+            return
+        unselected_border = self._color_palette_container.cget("bg")
+        selected_border = "#2583f5"
         for color_id, button in self._color_buttons.items():
-            button.configure(relief=tk.SUNKEN if color_id in self._selected_color_ids else tk.RAISED)
+            border = self._color_button_frames.get(color_id)
+            if border is not None:
+                border.configure(bg=selected_border if color_id in self._selected_color_ids else unselected_border)
+            button.configure(relief=tk.FLAT, bd=0)
 
     def _set_input_preview_from_bgr_array(self, image_bgr: np.ndarray) -> None:
         rgb = image_bgr[:, :, ::-1]
         self._preview_images["input"] = Image.fromarray(rgb, mode="RGB")
-        self._render_preview("input", force=True)
-
-    def _set_input_preview_from_bgra_array(self, image_bgra: np.ndarray) -> None:
-        rgba = image_bgra[:, :, [2, 1, 0, 3]]
-        self._preview_images["input"] = Image.fromarray(rgba, mode="RGBA")
         self._render_preview("input", force=True)
 
     def _refresh_color_options_for_image(self, image_path: Path) -> None:
@@ -381,43 +459,14 @@ class GoshuinScanApp:
             return
 
         self._color_options = options
-        self._selected_color_ids = set()
-        self._color_palette_hint_var.set("色ブロックをクリックすると、その色域が入力画像から削除されます。")
+        self._selected_color_ids = self._pick_default_keep_color_ids(options)
+        if self._selected_color_ids:
+            self._color_palette_hint_var.set(
+                "黒字と朱印に近い色を既定で選択済みです。必要に応じて変更してください。"
+            )
+        else:
+            self._color_palette_hint_var.set("保持したい色を選択してください（選択色は最終透過で残します）。")
         self._render_color_blocks()
-        self._update_live_alpha_preview()
-
-    def _update_live_alpha_preview(self) -> None:
-        if self._color_preview_source is None or not self._color_options:
-            return
-
-        if not self._selected_color_ids:
-            self._manual_input_override = None
-            self._set_input_preview_from_bgr_array(self._color_preview_source)
-            return
-
-        remove_mask = build_selected_color_mask(
-            self._color_preview_source,
-            self._color_options,
-            sorted(self._selected_color_ids),
-        )
-        if remove_mask is None or float(remove_mask.max()) <= 0.01:
-            self._manual_input_override = None
-            self._set_input_preview_from_bgr_array(self._color_preview_source)
-            return
-
-        src = self._color_preview_source.astype(np.float32)
-        remove_mask = np.clip(remove_mask, 0.0, 1.0)
-        keep_mask = 1.0 - remove_mask
-        keep_3 = keep_mask[:, :, None]
-        white_bg = np.full_like(src, 255.0)
-        merged = (src * keep_3 + white_bg * (1.0 - keep_3)).astype(np.uint8)
-        preview_alpha = (keep_mask * 255.0).astype(np.uint8)
-        preview_bgra = cv2.cvtColor(src.astype(np.uint8), cv2.COLOR_BGR2BGRA)
-        preview_bgra[:, :, 3] = preview_alpha
-        preview_bgra[preview_alpha == 0, :3] = 0
-
-        self._manual_input_override = merged
-        self._set_input_preview_from_bgra_array(preview_bgra)
 
     def _start_process(self) -> None:
         if self._processing:
@@ -450,20 +499,13 @@ class GoshuinScanApp:
                 return
             image_paths = [image_path]
 
-        source_image_override_payload: Optional[np.ndarray] = None
-        if not folder_text and self._color_options:
-            if self._selected_color_ids:
-                if self._manual_input_override is None:
-                    self._update_live_alpha_preview()
-                if self._manual_input_override is None:
-                    messagebox.showerror("入力エラー", "選択色の入力画像を生成できませんでした。")
-                    return
-                source_image_override_payload = self._manual_input_override.copy()
+        color_options_payload: list[dict[str, Any]] = []
+        selected_color_ids_payload: list[int] = []
+        if not folder_text and self._color_options and self._selected_color_ids:
+            color_options_payload = [dict(opt) for opt in self._color_options]
+            selected_color_ids_payload = sorted(self._selected_color_ids)
 
         self._update_preview_from_path("input", image_paths[0])
-        if source_image_override_payload is not None:
-            self._set_input_preview_from_bgr_array(source_image_override_payload)
-        self._processing_manual_input = source_image_override_payload is not None
         self._set_processing(True)
         self._append_log(f"処理開始: {len(image_paths)} 件")
 
@@ -474,7 +516,8 @@ class GoshuinScanApp:
                 output_dir,
                 self.use_gpu_var.get(),
                 self.use_ai_var.get(),
-                source_image_override_payload,
+                color_options_payload,
+                selected_color_ids_payload,
             ),
             daemon=True,
         )
@@ -486,7 +529,8 @@ class GoshuinScanApp:
         output_dir: Path,
         use_gpu: bool,
         use_ai: bool = False,
-        source_image_override: Optional[np.ndarray] = None,
+        color_options: Optional[list[dict[str, Any]]] = None,
+        selected_color_ids: Optional[list[int]] = None,
     ) -> None:
         try:
             device = "cuda" if use_gpu and torch.cuda.is_available() else "cpu"
@@ -505,7 +549,8 @@ class GoshuinScanApp:
                     result = processor.process(
                         image_path,
                         output_dir,
-                        source_image_override=source_image_override if total == 1 else None,
+                        color_options=color_options if total == 1 else None,
+                        selected_color_ids=selected_color_ids if total == 1 else None,
                     )
                     success += 1
                     self._event_queue.put(
@@ -617,10 +662,7 @@ class GoshuinScanApp:
         self._append_log(f"[{index}/{total}] 補正画像: {result.enhanced_path}")
         self._append_log(f"[{index}/{total}] 透過画像: {result.transparent_path}")
 
-        if self._processing_manual_input and self._manual_input_override is not None and total == 1:
-            self._set_input_preview_from_bgr_array(self._manual_input_override)
-        else:
-            self._update_preview_from_path("input", Path(image_path))
+        self._update_preview_from_path("input", Path(image_path))
         self._update_preview_from_path("enhanced", result.enhanced_path)
         self._update_preview_from_path("transparent", result.transparent_path)
         
@@ -629,7 +671,6 @@ class GoshuinScanApp:
 
     def _on_batch_done(self, payload: dict) -> None:
         self._set_processing(False)
-        self._processing_manual_input = False
         total = payload["total"]
         success = payload["success"]
         failed: list[tuple[str, str]] = payload["failed"]
@@ -655,7 +696,6 @@ class GoshuinScanApp:
 
     def _on_process_error(self, error_message: str) -> None:
         self._set_processing(False)
-        self._processing_manual_input = False
         self._append_log(f"処理失敗: {error_message}")
         messagebox.showerror("処理失敗", error_message)
 
@@ -677,13 +717,14 @@ class GoshuinScanApp:
         column: int,
     ) -> None:
         panel = ttk.LabelFrame(parent, text=title, padding=6)
-        panel.grid(row=0, column=column, sticky=tk.NSEW, padx=4)
-        panel.columnconfigure(0, weight=1)
-        panel.rowconfigure(0, weight=1)
+        panel.grid(row=0, column=column, sticky=tk.NW, padx=4)
+        panel.configure(width=_MAIN_PREVIEW_PANEL_WIDTH, height=_MAIN_PREVIEW_PANEL_HEIGHT)
+        panel.grid_propagate(False)
+        panel.columnconfigure(0, weight=0)
+        panel.rowconfigure(0, weight=0)
 
         preview_label = ttk.Label(panel, anchor=tk.CENTER, justify=tk.CENTER)
-        preview_label.grid(row=0, column=0, sticky=tk.NSEW)
-        preview_label.bind("<Configure>", lambda _event, image_key=key: self._render_preview(image_key))
+        preview_label.grid(row=0, column=0, sticky=tk.NW)
         self._preview_labels[key] = preview_label
         self._set_preview_placeholder(key, placeholder)
 
@@ -713,15 +754,8 @@ class GoshuinScanApp:
         if source_image is None:
             return
 
-        w, h = label.winfo_width(), label.winfo_height()
-
-        # ウィンドウがまだ描画されていない場合はリトライ
-        if w <= 10 or h <= 10:
-            self.root.after(60, lambda image_key=key: self._render_preview(image_key, force=force))
-            return
-
-        target_width = max(w - 16, 1)
-        target_height = max(h - 16, 1)
+        target_width = max(_MAIN_PREVIEW_PANEL_WIDTH - 18, 1)
+        target_height = max(_MAIN_PREVIEW_PANEL_HEIGHT - 38, 1)
 
         # 画面リサイズ等の場合、現在の画像のサイズと目標サイズを比較し無駄な再描画を防ぐ
         if not force:
@@ -735,11 +769,61 @@ class GoshuinScanApp:
         self._preview_photo_refs[key] = preview_tk
         label.configure(image=preview_tk, text="")
 
+    def _open_log_window(self) -> None:
+        if self._log_window is not None and self._log_window.winfo_exists():
+            self._log_window.deiconify()
+            self._log_window.lift()
+            self._log_window.focus_force()
+            return
+
+        window = tk.Toplevel(self.root)
+        self._log_window = window
+        window.title("ログ")
+        window.geometry("550x260")
+        window.minsize(380, 180)
+
+        frame = ttk.Frame(window, padding=10)
+        frame.pack(fill=tk.BOTH, expand=True)
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(0, weight=1)
+
+        text_widget = tk.Text(frame, wrap=tk.WORD, state=tk.NORMAL, font=("Consolas", 10))
+        text_widget.grid(row=0, column=0, sticky=tk.NSEW)
+        scroll = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=text_widget.yview)
+        scroll.grid(row=0, column=1, sticky=tk.NS)
+        text_widget.configure(yscrollcommand=scroll.set)
+
+        if self._log_lines:
+            text_widget.insert(tk.END, "\n".join(self._log_lines) + "\n")
+        text_widget.see(tk.END)
+        text_widget.configure(state=tk.DISABLED)
+        self._log_text_widget = text_widget
+
+        def _on_close() -> None:
+            self._close_log_window()
+
+        window.protocol("WM_DELETE_WINDOW", _on_close)
+
+    def _close_log_window(self) -> None:
+        if self._log_window is not None and self._log_window.winfo_exists():
+            self._log_window.destroy()
+        self._log_window = None
+        self._log_text_widget = None
+
     def _append_log(self, message: str) -> None:
-        self.log_text.configure(state=tk.NORMAL)
-        self.log_text.insert(tk.END, f"{message}\n")
-        self.log_text.see(tk.END)
-        self.log_text.configure(state=tk.DISABLED)
+        line = str(message)
+        self._log_lines.append(line)
+        if len(self._log_lines) > 3000:
+            self._log_lines = self._log_lines[-2500:]
+
+        if self._log_text_widget is None or not self._log_text_widget.winfo_exists():
+            self._log_text_widget = None
+            return
+
+        self._log_text_widget.configure(state=tk.NORMAL)
+        self._log_text_widget.insert(tk.END, f"{line}\n")
+        self._log_text_widget.see(tk.END)
+        self._log_text_widget.configure(state=tk.DISABLED)
 
 
 def main() -> None:

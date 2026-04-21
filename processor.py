@@ -225,22 +225,6 @@ def GoshuinSensoryExtractor(image: np.ndarray) -> np.ndarray:
         cv2.inRange(hsv, (160, 45, 20), (180, 255, 255)) > 0
     )
 
-    gold_strong_mask = (cv2.inRange(hsv, (10, 32, 70), (48, 255, 255)) > 0) | (
-        (l_ch >= 118) & (a_ch >= 118) & (b_ch >= 138)
-    )
-    gold_soft_mask = (
-        (cv2.inRange(hsv, (8, 14, 100), (52, 255, 255)) > 0)
-        & (b_ch >= 130)
-        & (a_ch >= 108)
-    )
-
-    silver_base_mask = (
-        (s <= 52)
-        & (v >= 155)
-        & (np.abs(a_i16 - 128) <= 12)
-        & (np.abs(b_i16 - 128) <= 12)
-    )
-
     colorful_ink_mask = (
         (s >= 44)
         & (v >= 30)
@@ -262,7 +246,7 @@ def GoshuinSensoryExtractor(image: np.ndarray) -> np.ndarray:
     texture_mask = (lap_norm > 0.09) | edge_mask
     texture_strong_mask = (lap_norm > 0.13) | edge_mask
 
-    anchor_seed = black_mask | red_mask | colorful_ink_mask | gold_strong_mask
+    anchor_seed = black_mask | red_mask | colorful_ink_mask
     anchor_u8 = (anchor_seed.astype(np.uint8) * 255)
     anchor_near = cv2.dilate(
         anchor_u8,
@@ -270,14 +254,7 @@ def GoshuinSensoryExtractor(image: np.ndarray) -> np.ndarray:
         iterations=2,
     ) > 0
 
-    gold_mask = gold_strong_mask | (gold_soft_mask & (anchor_near | texture_strong_mask | (s >= 42)))
-    silver_mask = silver_base_mask & (texture_strong_mask & anchor_near)
-    metallic_mask = gold_mask | silver_mask
-    non_metal_mask = black_mask | red_mask | colorful_ink_mask
-
-    initial_mask = (non_metal_mask & (~paper_mask | texture_mask)) | (
-        metallic_mask & (anchor_near | texture_strong_mask | (s >= 45))
-    )
+    initial_mask = (black_mask | red_mask | colorful_ink_mask) & (~paper_mask | texture_mask)
 
     mask_u8 = initial_mask.astype(np.uint8) * 255
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
@@ -287,13 +264,9 @@ def GoshuinSensoryExtractor(image: np.ndarray) -> np.ndarray:
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask_u8, connectivity=8)
     filtered = np.zeros_like(mask_u8)
     min_area = max(32, int(image.shape[0] * image.shape[1] * 0.00003))
-    metallic_u8 = metallic_mask.astype(np.uint8) * 255
     for label_id in range(1, num_labels):
         area = stats[label_id, cv2.CC_STAT_AREA]
-        comp = labels == label_id
-        comp_is_metal = bool(np.any(metallic_u8[comp] > 0))
-        area_threshold = max(14, min_area // 2) if comp_is_metal else min_area
-        if area >= area_threshold:
+        if area >= min_area:
             filtered[labels == label_id] = 255
 
     alpha = filtered.astype(np.float32) / 255.0
@@ -813,31 +786,18 @@ class GoshuinProcessor:
         selected_color_ids: Optional[list[int]] = None,
     ) -> np.ndarray:
         foreground_mask = self._predict_foreground_mask(image)
-        use_custom_colors = bool(color_options and selected_color_ids)
 
-        if use_custom_colors:
-            selected_mask = build_selected_color_mask(image, color_options or [], selected_color_ids or [])
+        ink_stamp_mask = self._extract_ink_stamp_mask(image)
+        alpha = np.clip(foreground_mask * ink_stamp_mask, 0.0, 1.0)
+        alpha = np.where(alpha > 0.09, alpha, 0.0)
+
+        if color_options and selected_color_ids:
+            selected_mask = build_selected_color_mask(image, color_options, selected_color_ids)
             if float(selected_mask.max()) > 0.02:
-                alpha = np.clip(foreground_mask * selected_mask, 0.0, 1.0)
-                alpha = np.where(alpha > 0.06, alpha, 0.0)
+                # Keep selected colors opaque in final transparent output.
+                alpha = np.maximum(alpha, np.clip(selected_mask, 0.0, 1.0))
             else:
-                self._log("選択した色のマスクが空でした。既定の抽出ロジックにフォールバックします。")
-                use_custom_colors = False
-
-        if not use_custom_colors:
-            ink_stamp_mask = self._extract_ink_stamp_mask(image)
-            metallic_hint = self._extract_metallic_hint(image)
-
-            alpha_base = np.clip(foreground_mask * ink_stamp_mask, 0.0, 1.0)
-            fg_near = cv2.dilate(
-                ((foreground_mask > 0.12).astype(np.uint8) * 255),
-                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
-                iterations=2,
-            ).astype(np.float32) / 255.0
-            rescue_context = np.maximum(fg_near, np.clip(ink_stamp_mask, 0.0, 1.0))
-            alpha_metallic_rescue = np.clip(metallic_hint * rescue_context * 0.9, 0.0, 1.0)
-            alpha = np.maximum(alpha_base, alpha_metallic_rescue)
-            alpha = np.where(alpha > 0.09, alpha, 0.0)
+                self._log("選択した保持色マスクが空のため、既定抽出のみを使用します。")
 
         alpha_u8 = (alpha * 255).astype(np.uint8)
 
@@ -869,60 +829,6 @@ class GoshuinProcessor:
         mask = cv2.resize(mask, (width, height), interpolation=cv2.INTER_CUBIC)
         mask = np.clip(mask, 0.0, 1.0)
         return mask
-
-    @staticmethod
-    def _extract_metallic_hint(image: np.ndarray) -> np.ndarray:
-        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
-        lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
-        h, s, v = cv2.split(hsv)
-        l_ch, a_ch, b_ch = cv2.split(lab)
-
-        a_i16 = a_ch.astype(np.int16)
-        b_i16 = b_ch.astype(np.int16)
-
-        gold_hint = (
-            ((h >= 10) & (h <= 48) & (s >= 22) & (v >= 95))
-            | ((l_ch >= 118) & (a_ch >= 118) & (b_ch >= 138))
-        )
-        silver_hint = (
-            (s <= 50)
-            & (v >= 160)
-            & (np.abs(a_i16 - 128) <= 11)
-            & (np.abs(b_i16 - 128) <= 11)
-        )
-
-        l_blur = cv2.GaussianBlur(l_ch, (0, 0), sigmaX=1.2)
-        edge_mask = cv2.Canny(l_blur, 60, 140) > 0
-        lap = cv2.Laplacian(l_blur, cv2.CV_32F, ksize=3)
-        lap_abs = np.abs(lap)
-        lap_norm = cv2.normalize(lap_abs, None, 0.0, 1.0, cv2.NORM_MINMAX)
-        texture_mask = (lap_norm > 0.11) | edge_mask
-
-        anchor_mask = (
-            ((v <= 92) & (l_ch <= 118))
-            | ((h <= 15) & (s >= 45) & (v >= 30))
-            | ((h >= 160) & (s >= 45) & (v >= 30))
-            | ((s >= 44) & (((h >= 46) & (h <= 159)) | ((h >= 161) & (h <= 175))))
-        )
-        anchor_near = cv2.dilate(
-            (anchor_mask.astype(np.uint8) * 255),
-            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
-            iterations=2,
-        ) > 0
-
-        paper_like = (
-            (s <= 32)
-            & (v >= 160)
-            & (np.abs(a_i16 - 128) <= 11)
-            & (np.abs(b_i16 - 128) <= 12)
-        )
-
-        metallic = (gold_hint | silver_hint) & (~paper_like | (texture_mask & anchor_near) | (s >= 48))
-        metallic_u8 = metallic.astype(np.uint8) * 255
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-        metallic_u8 = cv2.morphologyEx(metallic_u8, cv2.MORPH_CLOSE, kernel, iterations=1)
-        metallic_u8 = cv2.morphologyEx(metallic_u8, cv2.MORPH_OPEN, kernel, iterations=1)
-        return metallic_u8.astype(np.float32) / 255.0
 
     @staticmethod
     def _find_tensor(output):

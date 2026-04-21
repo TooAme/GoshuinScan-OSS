@@ -8,7 +8,66 @@ Python GUI を使用して御朱印の写真を処理します：
 1. **単画像 / フォルダー一括処理**：1 枚の画像または画像フォルダーを入力として選択でき、フォルダー選択時は中の対応画像を自動でまとめて処理します。
 2. **幾何補正（UVDoc）**：PaddleOCR の UVDoc モジュールを使用して、撮影時の傾き・パース歪みを補正します（失敗時は従来の RMBG ベース補正にフォールバック）。
 3. **ドキュメント補正**：docTR と古典的な画像補正アルゴリズム（CLAHE およびシャープネス）を組み合わせ、残りの微小な傾きを修正し、コントラストを強化します。
-4. **背景除去とインク抽出**：RMBG-2.0 を再度適用して背景を完璧に取り除き、適応的閾値（Adaptive Threshold）などで朱印（赤）と墨跡（黒）のみを保持した高精度な透過 PNG を出力します。
+4. **背景除去とインク抽出**：RMBG-2.0 の前景マスクと `GoshuinSensoryExtractor` を合成し、和紙背景を透過化した PNG を出力します。
+5. **保持色選択（単画像時）**：画像選択後に色域候補を抽出し、黒字・朱印に近い色を既定選択します。ユーザーが色ブロックを ON/OFF すると、最終透過時にその色域を保持できます（入力画像自体は変更しません）。
+
+## 現在の処理フロー
+```mermaid
+sequenceDiagram
+    autonumber
+
+    participant U as ユーザー (GUI)
+    participant A as app.py
+    participant P as processor.py (GoshuinProcessor)
+    participant UV as UVDoc (PaddleOCR)
+    participant DT as docTR
+    participant RB as RMBG-2.0
+    participant EX as GoshuinSensoryExtractor
+    participant AI as Qwen3-VL + LoRA
+    participant FS as 出力ディスク
+
+    U->>A: 入力を選択（単画像 or フォルダー）
+    alt 単画像
+        A->>A: 色域候補を抽出
+        A->>A: 黒字/朱印近似色を既定選択
+        U->>A: 保持色ブロックを調整（任意）
+    else フォルダー
+        A->>A: 対応画像を列挙
+    end
+
+    U->>A: 処理開始
+    A->>P: process(image_path, output_dir, color_options, selected_color_ids)
+
+    loop 画像ごと
+        P->>UV: 幾何補正を実行
+        alt UVDoc 成功
+            UV-->>P: 補正済み画像
+        else UVDoc 失敗
+            P->>RB: 前景マスクを推論（fallback 用）
+            RB-->>P: foreground mask
+            P->>P: 従来パース補正
+        end
+
+        P->>DT: ドキュメント補正 + CLAHE/Sharpen
+        DT-->>P: enhanced image
+        P->>FS: 保存 *_enhanced_doctr.png
+
+        P->>RB: 前景マスク推論
+        RB-->>P: foreground mask
+        P->>EX: 墨/印マスク抽出
+        EX-->>P: ink_stamp mask
+        P->>P: alpha = foreground × ink_stamp
+        opt 単画像で保持色が選択されている場合
+            P->>P: 選択色マスクを alpha に合成
+        end
+        P->>FS: 保存 *_ink_stamp_transparent.png
+
+        opt AI 識別が有効な場合
+            A->>AI: 画像解析リクエスト
+            AI-->>A: name/date/text/mark
+        end
+    end
+```
 
 ## 必須環境
 - Python 3.10+
@@ -94,11 +153,12 @@ $env:RMBG_MODEL_ID = "briaai/RMBG-1.4"
    - `画像を選択`：単画像処理
    - `画像フォルダー` の `フォルダーを選択`：フォルダー一括処理
 2. `出力フォルダー` の `フォルダーを選択` をクリックして、保存先を指定します。
-3. 任意：`GPU (CUDA) を使用`、`AI 識別 (LoRA モデル)` を有効化します。
-4. `処理開始` をクリックします。
+3. 単画像処理時のみ、保持色ブロックが表示されます（黒字・朱印近似色は既定で選択済み）。
+4. 任意：`GPU (CUDA) を使用`、`AI 識別 (LoRA モデル)` を有効化します。
+5. `処理開始` をクリックします。
 
 対応拡張子: `.jpg .jpeg .png .bmp .webp .tif .tiff`
 
 処理が完了すると、指定した出力ディレクトリに以下のファイルが生成されます：
 - `*_enhanced_doctr.png`：UVDoc 幾何補正 + docTR 補正済みの画像
-- `*_ink_stamp_transparent.png`：黒墨と赤朱印のみを保持した透過背景 PNG
+- `*_ink_stamp_transparent.png`：墨/印抽出結果の透過背景 PNG（保持色選択がある場合は該当色域も保持）
