@@ -40,6 +40,269 @@ class ProcessResult:
     transparent_path: Path
 
 
+def _lab_to_bgr_tuple(lab_color: np.ndarray) -> tuple[int, int, int]:
+    # cv2.cvtColor with COLOR_Lab2BGR expects OpenCV-Lab encoded range for uint8:
+    # L in [0,255], a in [0,255], b in [0,255].
+    lab_encoded = np.clip(np.rint(lab_color), 0, 255).astype(np.uint8)
+    lab_pixel = np.array([[lab_encoded]], dtype=np.uint8)
+    bgr_pixel = cv2.cvtColor(lab_pixel, cv2.COLOR_Lab2BGR)[0, 0]
+    return int(bgr_pixel[0]), int(bgr_pixel[1]), int(bgr_pixel[2])
+
+
+def extract_goshuin_color_options(
+    image: np.ndarray,
+    max_colors: int = 8,
+    min_ratio: float = 0.012,
+) -> list[dict[str, Any]]:
+    if image is None or image.size == 0:
+        return []
+    if image.ndim != 3 or image.shape[2] < 3:
+        return []
+
+    h, w = image.shape[:2]
+    max_side = max(h, w)
+    if max_side > 720:
+        scale = 720.0 / float(max_side)
+        resized = cv2.resize(image, (max(1, int(w * scale)), max(1, int(h * scale))), interpolation=cv2.INTER_AREA)
+    else:
+        resized = image.copy()
+
+    lab = cv2.cvtColor(resized, cv2.COLOR_BGR2LAB).reshape(-1, 3).astype(np.float32)
+    num_pixels = lab.shape[0]
+    if num_pixels < 64:
+        return []
+
+    dynamic_k = int(np.clip(np.sqrt(num_pixels) / 60.0, 3, max_colors))
+    k = int(max(3, min(max_colors, dynamic_k)))
+    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 35, 0.4)
+    _compactness, labels, centers = cv2.kmeans(
+        lab,
+        k,
+        None,
+        criteria,
+        4,
+        cv2.KMEANS_PP_CENTERS,
+    )
+
+    labels = labels.reshape(-1)
+    options: list[dict[str, Any]] = []
+
+    for cluster_idx in range(k):
+        cluster_mask = labels == cluster_idx
+        ratio = float(cluster_mask.mean())
+        if ratio < min_ratio:
+            continue
+
+        cluster_points = lab[cluster_mask]
+        center = centers[cluster_idx]
+        distances = np.linalg.norm(cluster_points - center, axis=1)
+        radius = float(np.clip(np.percentile(distances, 88) * 1.35 + 6.0, 12.0, 60.0))
+
+        l_val, a_val, b_val = float(center[0]), float(center[1]), float(center[2])
+        chroma = float(np.hypot(a_val - 128.0, b_val - 128.0))
+        is_background = bool((l_val >= 176 and chroma <= 14 and ratio >= 0.05) or (l_val >= 190 and chroma <= 20))
+
+        options.append(
+            {
+                "ratio": ratio,
+                "lab": [float(center[0]), float(center[1]), float(center[2])],
+                "radius": radius,
+                "bgr": list(_lab_to_bgr_tuple(center)),
+                "is_background": is_background,
+            }
+        )
+
+    # Merge nearby color options so users see fewer but broader color blocks.
+    merged: list[dict[str, Any]] = []
+    merge_distance = 18.0
+    for option in sorted(options, key=lambda item: item["ratio"], reverse=True):
+        center = np.array(option["lab"], dtype=np.float32)
+        merged_index = -1
+        for idx, base in enumerate(merged):
+            base_center = np.array(base["lab"], dtype=np.float32)
+            if np.linalg.norm(center - base_center) <= merge_distance:
+                merged_index = idx
+                break
+
+        if merged_index < 0:
+            merged.append(dict(option))
+            continue
+
+        base = merged[merged_index]
+        total_ratio = float(base["ratio"]) + float(option["ratio"])
+        if total_ratio <= 0:
+            continue
+        blended_center = (
+            np.array(base["lab"], dtype=np.float32) * float(base["ratio"])
+            + np.array(option["lab"], dtype=np.float32) * float(option["ratio"])
+        ) / total_ratio
+
+        base["ratio"] = total_ratio
+        base["lab"] = [float(blended_center[0]), float(blended_center[1]), float(blended_center[2])]
+        base["radius"] = float(np.clip(max(float(base["radius"]), float(option["radius"])) * 1.08, 12.0, 66.0))
+        base["bgr"] = list(_lab_to_bgr_tuple(np.array(base["lab"], dtype=np.float32)))
+
+        l_val = float(base["lab"][0])
+        a_val = float(base["lab"][1])
+        b_val = float(base["lab"][2])
+        chroma = float(np.hypot(a_val - 128.0, b_val - 128.0))
+        base["is_background"] = bool((l_val >= 176 and chroma <= 14 and total_ratio >= 0.05) or (l_val >= 190 and chroma <= 20))
+
+    options = [item for item in merged if float(item["ratio"]) >= min_ratio * 0.8]
+    options.sort(key=lambda item: item["ratio"], reverse=True)
+    options = options[:max_colors]
+    for idx, item in enumerate(options):
+        item["id"] = idx
+    return options
+
+
+def build_selected_color_mask(
+    image: np.ndarray,
+    color_options: list[dict[str, Any]],
+    selected_color_ids: list[int],
+) -> np.ndarray:
+    if image is None or image.size == 0:
+        return np.zeros((1, 1), dtype=np.float32)
+    if image.ndim != 3 or image.shape[2] < 3:
+        return np.zeros(image.shape[:2], dtype=np.float32)
+
+    selected_ids = {int(i) for i in selected_color_ids}
+    if not selected_ids:
+        return np.zeros(image.shape[:2], dtype=np.float32)
+
+    valid_options = []
+    for option in color_options:
+        center_vals = option.get("lab")
+        if isinstance(center_vals, list) and len(center_vals) == 3:
+            valid_options.append(option)
+
+    if not valid_options:
+        return np.zeros(image.shape[:2], dtype=np.float32)
+
+    # Ensure deterministic mapping between option id and center index.
+    valid_options.sort(key=lambda o: int(o.get("id", 0)))
+    option_ids = [int(o.get("id", -1)) for o in valid_options]
+    selected_indices = [idx for idx, oid in enumerate(option_ids) if oid in selected_ids]
+
+    if not selected_indices:
+        return np.zeros(image.shape[:2], dtype=np.float32)
+    if len(selected_indices) == len(valid_options):
+        return np.ones(image.shape[:2], dtype=np.float32)
+
+    lab_image = cv2.cvtColor(image, cv2.COLOR_BGR2LAB).astype(np.float32)
+    centers = np.array([o["lab"] for o in valid_options], dtype=np.float32)
+
+    # Full partition: every pixel belongs to nearest color option.
+    diff = lab_image[:, :, None, :] - centers[None, None, :, :]
+    dist = np.linalg.norm(diff, axis=3)
+    nearest_idx = np.argmin(dist, axis=2)
+    hard = np.isin(nearest_idx, selected_indices).astype(np.float32)
+
+    # Hard partition: each pixel is assigned to one nearest color option.
+    # This guarantees full coverage with no residual semi-transparent band.
+    return hard
+
+
+def GoshuinSensoryExtractor(image: np.ndarray) -> np.ndarray:
+    if image is None or image.size == 0:
+        raise ValueError("GoshuinSensoryExtractor: image is empty.")
+    if image.ndim != 3 or image.shape[2] < 3:
+        raise ValueError("GoshuinSensoryExtractor: expected BGR image with 3 channels.")
+
+    bgr = image[:, :, :3]
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)
+
+    h, s, v = cv2.split(hsv)
+    l_ch, a_ch, b_ch = cv2.split(lab)
+
+    a_i16 = a_ch.astype(np.int16)
+    b_i16 = b_ch.astype(np.int16)
+
+    black_mask = (v <= 86) & (l_ch <= 112)
+
+    red_mask = (cv2.inRange(hsv, (0, 42, 20), (15, 255, 255)) > 0) | (
+        cv2.inRange(hsv, (160, 45, 20), (180, 255, 255)) > 0
+    )
+
+    gold_strong_mask = (cv2.inRange(hsv, (10, 32, 70), (48, 255, 255)) > 0) | (
+        (l_ch >= 118) & (a_ch >= 118) & (b_ch >= 138)
+    )
+    gold_soft_mask = (
+        (cv2.inRange(hsv, (8, 14, 100), (52, 255, 255)) > 0)
+        & (b_ch >= 130)
+        & (a_ch >= 108)
+    )
+
+    silver_base_mask = (
+        (s <= 52)
+        & (v >= 155)
+        & (np.abs(a_i16 - 128) <= 12)
+        & (np.abs(b_i16 - 128) <= 12)
+    )
+
+    colorful_ink_mask = (
+        (s >= 44)
+        & (v >= 30)
+        & (((h >= 46) & (h <= 159)) | ((h >= 161) & (h <= 175)))
+    )
+
+    paper_mask = (
+        (s <= 34)
+        & (v >= 155)
+        & (np.abs(a_i16 - 128) <= 12)
+        & (np.abs(b_i16 - 128) <= 14)
+    )
+
+    l_blur = cv2.GaussianBlur(l_ch, (0, 0), sigmaX=1.2)
+    lap = cv2.Laplacian(l_blur, cv2.CV_32F, ksize=3)
+    lap_abs = np.abs(lap)
+    lap_norm = cv2.normalize(lap_abs, None, 0.0, 1.0, cv2.NORM_MINMAX)
+    edge_mask = cv2.Canny(l_blur, 60, 140) > 0
+    texture_mask = (lap_norm > 0.09) | edge_mask
+    texture_strong_mask = (lap_norm > 0.13) | edge_mask
+
+    anchor_seed = black_mask | red_mask | colorful_ink_mask | gold_strong_mask
+    anchor_u8 = (anchor_seed.astype(np.uint8) * 255)
+    anchor_near = cv2.dilate(
+        anchor_u8,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
+        iterations=2,
+    ) > 0
+
+    gold_mask = gold_strong_mask | (gold_soft_mask & (anchor_near | texture_strong_mask | (s >= 42)))
+    silver_mask = silver_base_mask & (texture_strong_mask & anchor_near)
+    metallic_mask = gold_mask | silver_mask
+    non_metal_mask = black_mask | red_mask | colorful_ink_mask
+
+    initial_mask = (non_metal_mask & (~paper_mask | texture_mask)) | (
+        metallic_mask & (anchor_near | texture_strong_mask | (s >= 45))
+    )
+
+    mask_u8 = initial_mask.astype(np.uint8) * 255
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    mask_u8 = cv2.morphologyEx(mask_u8, cv2.MORPH_CLOSE, kernel, iterations=1)
+    mask_u8 = cv2.morphologyEx(mask_u8, cv2.MORPH_OPEN, kernel, iterations=1)
+
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask_u8, connectivity=8)
+    filtered = np.zeros_like(mask_u8)
+    min_area = max(32, int(image.shape[0] * image.shape[1] * 0.00003))
+    metallic_u8 = metallic_mask.astype(np.uint8) * 255
+    for label_id in range(1, num_labels):
+        area = stats[label_id, cv2.CC_STAT_AREA]
+        comp = labels == label_id
+        comp_is_metal = bool(np.any(metallic_u8[comp] > 0))
+        area_threshold = max(14, min_area // 2) if comp_is_metal else min_area
+        if area >= area_threshold:
+            filtered[labels == label_id] = 255
+
+    alpha = filtered.astype(np.float32) / 255.0
+    fine_detail = (texture_strong_mask & anchor_near).astype(np.float32) * 0.28
+    alpha = np.maximum(alpha, fine_detail)
+    alpha = cv2.GaussianBlur(alpha, (0, 0), sigmaX=0.8)
+    return np.clip(alpha, 0.0, 1.0)
+
+
 class GoshuinProcessor:
     def __init__(
         self,
@@ -60,15 +323,26 @@ class GoshuinProcessor:
             ]
         )
 
-    def process(self, image_path: str | Path, output_dir: str | Path) -> ProcessResult:
+    def process(
+        self,
+        image_path: str | Path,
+        output_dir: str | Path,
+        source_image_override: Optional[np.ndarray] = None,
+        color_options: Optional[list[dict[str, Any]]] = None,
+        selected_color_ids: Optional[list[int]] = None,
+    ) -> ProcessResult:
         image_path = Path(image_path)
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        self._log(f"入力画像を読み込み: {image_path}")
-        source = self._read_image_unicode(image_path, cv2.IMREAD_COLOR)
-        if source is None:
-            raise ValueError(f"画像を読み込めません: {image_path}")
+        if source_image_override is not None:
+            source = source_image_override.copy()
+            self._log(f"入力画像を読み込み: {image_path} (色域選択済み入力を使用)")
+        else:
+            self._log(f"入力画像を読み込み: {image_path}")
+            source = self._read_image_unicode(image_path, cv2.IMREAD_COLOR)
+            if source is None:
+                raise ValueError(f"画像を読み込めません: {image_path}")
 
         self._log("ステップ 1/3: UVDoc 幾何補正")
         try:
@@ -93,7 +367,11 @@ class GoshuinProcessor:
         self._log(f"保存済み: {enhanced_path}")
 
         self._log("ステップ 3/3: RMBG-2.0 背景除去 (黒墨/朱印抽出)")
-        transparent = self._build_transparent_ink_stamp(source)
+        transparent = self._build_transparent_ink_stamp(
+            source,
+            color_options=color_options,
+            selected_color_ids=selected_color_ids,
+        )
         transparent_path = output_dir / f"{image_path.stem}_ink_stamp_transparent.png"
         self._write_image_unicode(transparent_path, transparent)
         self._log(f"保存済み: {transparent_path}")
@@ -528,12 +806,39 @@ class GoshuinProcessor:
         sharpened = cv2.addWeighted(enhanced, 1.5, blur, -0.5, 0)
         return sharpened
 
-    def _build_transparent_ink_stamp(self, image: np.ndarray) -> np.ndarray:
+    def _build_transparent_ink_stamp(
+        self,
+        image: np.ndarray,
+        color_options: Optional[list[dict[str, Any]]] = None,
+        selected_color_ids: Optional[list[int]] = None,
+    ) -> np.ndarray:
         foreground_mask = self._predict_foreground_mask(image)
-        ink_stamp_mask = self._extract_ink_stamp_mask(image)
+        use_custom_colors = bool(color_options and selected_color_ids)
 
-        alpha = np.clip(foreground_mask * ink_stamp_mask, 0.0, 1.0)
-        alpha = np.where(alpha > 0.08, alpha, 0.0)
+        if use_custom_colors:
+            selected_mask = build_selected_color_mask(image, color_options or [], selected_color_ids or [])
+            if float(selected_mask.max()) > 0.02:
+                alpha = np.clip(foreground_mask * selected_mask, 0.0, 1.0)
+                alpha = np.where(alpha > 0.06, alpha, 0.0)
+            else:
+                self._log("選択した色のマスクが空でした。既定の抽出ロジックにフォールバックします。")
+                use_custom_colors = False
+
+        if not use_custom_colors:
+            ink_stamp_mask = self._extract_ink_stamp_mask(image)
+            metallic_hint = self._extract_metallic_hint(image)
+
+            alpha_base = np.clip(foreground_mask * ink_stamp_mask, 0.0, 1.0)
+            fg_near = cv2.dilate(
+                ((foreground_mask > 0.12).astype(np.uint8) * 255),
+                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
+                iterations=2,
+            ).astype(np.float32) / 255.0
+            rescue_context = np.maximum(fg_near, np.clip(ink_stamp_mask, 0.0, 1.0))
+            alpha_metallic_rescue = np.clip(metallic_hint * rescue_context * 0.9, 0.0, 1.0)
+            alpha = np.maximum(alpha_base, alpha_metallic_rescue)
+            alpha = np.where(alpha > 0.09, alpha, 0.0)
+
         alpha_u8 = (alpha * 255).astype(np.uint8)
 
         output = cv2.cvtColor(image, cv2.COLOR_BGR2BGRA)
@@ -564,6 +869,60 @@ class GoshuinProcessor:
         mask = cv2.resize(mask, (width, height), interpolation=cv2.INTER_CUBIC)
         mask = np.clip(mask, 0.0, 1.0)
         return mask
+
+    @staticmethod
+    def _extract_metallic_hint(image: np.ndarray) -> np.ndarray:
+        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+        lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+        h, s, v = cv2.split(hsv)
+        l_ch, a_ch, b_ch = cv2.split(lab)
+
+        a_i16 = a_ch.astype(np.int16)
+        b_i16 = b_ch.astype(np.int16)
+
+        gold_hint = (
+            ((h >= 10) & (h <= 48) & (s >= 22) & (v >= 95))
+            | ((l_ch >= 118) & (a_ch >= 118) & (b_ch >= 138))
+        )
+        silver_hint = (
+            (s <= 50)
+            & (v >= 160)
+            & (np.abs(a_i16 - 128) <= 11)
+            & (np.abs(b_i16 - 128) <= 11)
+        )
+
+        l_blur = cv2.GaussianBlur(l_ch, (0, 0), sigmaX=1.2)
+        edge_mask = cv2.Canny(l_blur, 60, 140) > 0
+        lap = cv2.Laplacian(l_blur, cv2.CV_32F, ksize=3)
+        lap_abs = np.abs(lap)
+        lap_norm = cv2.normalize(lap_abs, None, 0.0, 1.0, cv2.NORM_MINMAX)
+        texture_mask = (lap_norm > 0.11) | edge_mask
+
+        anchor_mask = (
+            ((v <= 92) & (l_ch <= 118))
+            | ((h <= 15) & (s >= 45) & (v >= 30))
+            | ((h >= 160) & (s >= 45) & (v >= 30))
+            | ((s >= 44) & (((h >= 46) & (h <= 159)) | ((h >= 161) & (h <= 175))))
+        )
+        anchor_near = cv2.dilate(
+            (anchor_mask.astype(np.uint8) * 255),
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
+            iterations=2,
+        ) > 0
+
+        paper_like = (
+            (s <= 32)
+            & (v >= 160)
+            & (np.abs(a_i16 - 128) <= 11)
+            & (np.abs(b_i16 - 128) <= 12)
+        )
+
+        metallic = (gold_hint | silver_hint) & (~paper_like | (texture_mask & anchor_near) | (s >= 48))
+        metallic_u8 = metallic.astype(np.uint8) * 255
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        metallic_u8 = cv2.morphologyEx(metallic_u8, cv2.MORPH_CLOSE, kernel, iterations=1)
+        metallic_u8 = cv2.morphologyEx(metallic_u8, cv2.MORPH_OPEN, kernel, iterations=1)
+        return metallic_u8.astype(np.float32) / 255.0
 
     @staticmethod
     def _find_tensor(output):
@@ -655,33 +1014,7 @@ class GoshuinProcessor:
 
     @staticmethod
     def _extract_ink_stamp_mask(image: np.ndarray) -> np.ndarray:
-        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-
-        # 赤色（朱印）の抽出
-        red_1 = cv2.inRange(hsv, (0, 50, 35), (15, 255, 255))
-        red_2 = cv2.inRange(hsv, (165, 50, 35), (180, 255, 255))
-        red_mask = cv2.bitwise_or(red_1, red_2)
-
-        # 黒色（墨）の抽出
-        # 1. 太い筆文字や完全に暗い領域のためのグローバル閾値
-        black_mask_dark = cv2.inRange(gray, 0, 100)
-        
-        # 2. 細い線（絵など）やかすれた墨のための適応的閾値
-        gray_blur = cv2.GaussianBlur(gray, (5, 5), 0)
-        black_mask_adaptive = cv2.adaptiveThreshold(
-            gray_blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 31, 10
-        )
-        
-        black_mask = cv2.bitwise_or(black_mask_dark, black_mask_adaptive)
-
-        combined = cv2.bitwise_or(red_mask, black_mask)
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-        
-        # 小さなノイズを除去し、途切れた線を繋ぐ
-        combined = cv2.morphologyEx(combined, cv2.MORPH_OPEN, kernel, iterations=1)
-        combined = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, kernel, iterations=1)
-        return combined.astype(np.float32) / 255.0
+        return GoshuinSensoryExtractor(image)
 
     @staticmethod
     def _rotate_bound(image: np.ndarray, angle: float) -> np.ndarray:

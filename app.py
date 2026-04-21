@@ -7,11 +7,19 @@ import threading
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
+from typing import Any, Optional
 
+import cv2
+import numpy as np
 import torch
 from PIL import Image, ImageTk
 
-from processor import GoshuinProcessor, ProcessResult
+from processor import (
+    GoshuinProcessor,
+    ProcessResult,
+    build_selected_color_mask,
+    extract_goshuin_color_options,
+)
 
 def _load_dotenv(dotenv_path: Path) -> None:
     if not dotenv_path.exists():
@@ -81,6 +89,14 @@ class GoshuinScanApp:
             "transparent": None,
         }
         self._preview_photo_refs: dict[str, ImageTk.PhotoImage] = {}
+        self._color_options: list[dict[str, Any]] = []
+        self._selected_color_ids: set[int] = set()
+        self._color_buttons: dict[int, tk.Button] = {}
+        self._color_palette_container: Optional[tk.Frame] = None
+        self._color_palette_hint_var = tk.StringVar(value="画像を選択すると色域候補が表示されます。")
+        self._color_preview_source = None
+        self._manual_input_override = None
+        self._processing_manual_input = False
 
         self._build_ui()
         self.root.after(100, self._poll_events)
@@ -141,6 +157,12 @@ class GoshuinScanApp:
             input_frame,
             text="※ 画像フォルダーを指定した場合は、フォルダー内の画像を一括処理します。",
         ).grid(row=3, column=0, columnspan=3, sticky=tk.W, pady=(2, 0))
+
+        color_frame = ttk.LabelFrame(left_panel, text="保持色の選択", padding=8)
+        color_frame.pack(fill=tk.X, pady=(10, 0))
+        self._color_palette_container = tk.Frame(color_frame)
+        self._color_palette_container.pack(fill=tk.X, anchor=tk.W)
+        ttk.Label(color_frame, textvariable=self._color_palette_hint_var).pack(anchor=tk.W, pady=(6, 0))
 
         options_frame = ttk.Frame(left_panel)
         options_frame.pack(fill=tk.X, pady=(10, 0))
@@ -247,6 +269,7 @@ class GoshuinScanApp:
             self._update_preview_from_path("input", Path(path))
             self._set_preview_placeholder("enhanced", "処理後の補正画像がここに表示されます。")
             self._set_preview_placeholder("transparent", "処理後の透過画像がここに表示されます。")
+            self._refresh_color_options_for_image(Path(path))
 
     def _select_input_dir(self) -> None:
         path = filedialog.askdirectory(title="画像フォルダーを選択")
@@ -254,6 +277,7 @@ class GoshuinScanApp:
             folder_path = Path(path)
             self.folder_path_var.set(path)
             self.image_path_var.set("")
+            self._clear_color_options("フォルダー一括処理では色選択は適用されません。")
 
             images = self._collect_images_from_folder(folder_path)
             if images:
@@ -277,6 +301,123 @@ class GoshuinScanApp:
             if p.is_file() and p.suffix.lower() in _SUPPORTED_IMAGE_EXTENSIONS:
                 image_paths.append(p)
         return image_paths
+
+    @staticmethod
+    def _bgr_to_hex(color_bgr: list[int]) -> str:
+        b, g, r = [int(x) for x in color_bgr[:3]]
+        return f"#{r:02x}{g:02x}{b:02x}"
+
+    def _clear_color_options(self, hint: str = "画像を選択すると色域候補が表示されます。") -> None:
+        self._color_options = []
+        self._selected_color_ids.clear()
+        self._color_buttons.clear()
+        self._color_palette_hint_var.set(hint)
+        self._color_preview_source = None
+        self._manual_input_override = None
+        if self._color_palette_container is None:
+            return
+        for child in self._color_palette_container.winfo_children():
+            child.destroy()
+
+    def _render_color_blocks(self) -> None:
+        if self._color_palette_container is None:
+            return
+        for child in self._color_palette_container.winfo_children():
+            child.destroy()
+        self._color_buttons.clear()
+
+        if not self._color_options:
+            return
+
+        columns = 12
+        for idx, option in enumerate(self._color_options):
+            color_id = int(option["id"])
+            color_hex = self._bgr_to_hex(option["bgr"])
+            button = tk.Button(
+                self._color_palette_container,
+                width=2,
+                height=1,
+                bg=color_hex,
+                activebackground=color_hex,
+                relief=tk.SUNKEN if color_id in self._selected_color_ids else tk.RAISED,
+                bd=2,
+                command=lambda cid=color_id: self._toggle_color_selection(cid),
+            )
+            button.grid(row=idx // columns, column=idx % columns, padx=3, pady=3, sticky=tk.W)
+            self._color_buttons[color_id] = button
+
+    def _toggle_color_selection(self, color_id: int) -> None:
+        if color_id in self._selected_color_ids:
+            self._selected_color_ids.remove(color_id)
+        else:
+            self._selected_color_ids.add(color_id)
+        self._update_color_block_styles()
+        self._update_live_alpha_preview()
+
+    def _update_color_block_styles(self) -> None:
+        for color_id, button in self._color_buttons.items():
+            button.configure(relief=tk.SUNKEN if color_id in self._selected_color_ids else tk.RAISED)
+
+    def _set_input_preview_from_bgr_array(self, image_bgr: np.ndarray) -> None:
+        rgb = image_bgr[:, :, ::-1]
+        self._preview_images["input"] = Image.fromarray(rgb, mode="RGB")
+        self._render_preview("input", force=True)
+
+    def _set_input_preview_from_bgra_array(self, image_bgra: np.ndarray) -> None:
+        rgba = image_bgra[:, :, [2, 1, 0, 3]]
+        self._preview_images["input"] = Image.fromarray(rgba, mode="RGBA")
+        self._render_preview("input", force=True)
+
+    def _refresh_color_options_for_image(self, image_path: Path) -> None:
+        image = GoshuinProcessor._read_image_unicode(image_path, 1)
+        if image is None:
+            self._clear_color_options("色域候補の解析に失敗しました。")
+            return
+
+        self._color_preview_source = image
+        options = extract_goshuin_color_options(image)
+        if not options:
+            self._clear_color_options("色域候補を抽出できませんでした。")
+            return
+
+        self._color_options = options
+        self._selected_color_ids = set()
+        self._color_palette_hint_var.set("色ブロックをクリックすると、その色域が入力画像から削除されます。")
+        self._render_color_blocks()
+        self._update_live_alpha_preview()
+
+    def _update_live_alpha_preview(self) -> None:
+        if self._color_preview_source is None or not self._color_options:
+            return
+
+        if not self._selected_color_ids:
+            self._manual_input_override = None
+            self._set_input_preview_from_bgr_array(self._color_preview_source)
+            return
+
+        remove_mask = build_selected_color_mask(
+            self._color_preview_source,
+            self._color_options,
+            sorted(self._selected_color_ids),
+        )
+        if remove_mask is None or float(remove_mask.max()) <= 0.01:
+            self._manual_input_override = None
+            self._set_input_preview_from_bgr_array(self._color_preview_source)
+            return
+
+        src = self._color_preview_source.astype(np.float32)
+        remove_mask = np.clip(remove_mask, 0.0, 1.0)
+        keep_mask = 1.0 - remove_mask
+        keep_3 = keep_mask[:, :, None]
+        white_bg = np.full_like(src, 255.0)
+        merged = (src * keep_3 + white_bg * (1.0 - keep_3)).astype(np.uint8)
+        preview_alpha = (keep_mask * 255.0).astype(np.uint8)
+        preview_bgra = cv2.cvtColor(src.astype(np.uint8), cv2.COLOR_BGR2BGRA)
+        preview_bgra[:, :, 3] = preview_alpha
+        preview_bgra[preview_alpha == 0, :3] = 0
+
+        self._manual_input_override = merged
+        self._set_input_preview_from_bgra_array(preview_bgra)
 
     def _start_process(self) -> None:
         if self._processing:
@@ -309,19 +450,43 @@ class GoshuinScanApp:
                 return
             image_paths = [image_path]
 
+        source_image_override_payload: Optional[np.ndarray] = None
+        if not folder_text and self._color_options:
+            if self._selected_color_ids:
+                if self._manual_input_override is None:
+                    self._update_live_alpha_preview()
+                if self._manual_input_override is None:
+                    messagebox.showerror("入力エラー", "選択色の入力画像を生成できませんでした。")
+                    return
+                source_image_override_payload = self._manual_input_override.copy()
+
         self._update_preview_from_path("input", image_paths[0])
+        if source_image_override_payload is not None:
+            self._set_input_preview_from_bgr_array(source_image_override_payload)
+        self._processing_manual_input = source_image_override_payload is not None
         self._set_processing(True)
         self._append_log(f"処理開始: {len(image_paths)} 件")
 
         worker = threading.Thread(
             target=self._process_worker,
-            args=(image_paths, output_dir, self.use_gpu_var.get(), self.use_ai_var.get()),
+            args=(
+                image_paths,
+                output_dir,
+                self.use_gpu_var.get(),
+                self.use_ai_var.get(),
+                source_image_override_payload,
+            ),
             daemon=True,
         )
         worker.start()
 
     def _process_worker(
-        self, image_paths: list[Path], output_dir: Path, use_gpu: bool, use_ai: bool = False
+        self,
+        image_paths: list[Path],
+        output_dir: Path,
+        use_gpu: bool,
+        use_ai: bool = False,
+        source_image_override: Optional[np.ndarray] = None,
     ) -> None:
         try:
             device = "cuda" if use_gpu and torch.cuda.is_available() else "cpu"
@@ -337,7 +502,11 @@ class GoshuinScanApp:
             for index, image_path in enumerate(image_paths, start=1):
                 self._event_queue.put(("log", f"[{index}/{total}] 処理開始: {image_path}"))
                 try:
-                    result = processor.process(image_path, output_dir)
+                    result = processor.process(
+                        image_path,
+                        output_dir,
+                        source_image_override=source_image_override if total == 1 else None,
+                    )
                     success += 1
                     self._event_queue.put(
                         (
@@ -447,8 +616,11 @@ class GoshuinScanApp:
         self._append_log(f"[{index}/{total}] 完了: {Path(image_path).name}")
         self._append_log(f"[{index}/{total}] 補正画像: {result.enhanced_path}")
         self._append_log(f"[{index}/{total}] 透過画像: {result.transparent_path}")
-        
-        self._update_preview_from_path("input", Path(image_path))
+
+        if self._processing_manual_input and self._manual_input_override is not None and total == 1:
+            self._set_input_preview_from_bgr_array(self._manual_input_override)
+        else:
+            self._update_preview_from_path("input", Path(image_path))
         self._update_preview_from_path("enhanced", result.enhanced_path)
         self._update_preview_from_path("transparent", result.transparent_path)
         
@@ -457,6 +629,7 @@ class GoshuinScanApp:
 
     def _on_batch_done(self, payload: dict) -> None:
         self._set_processing(False)
+        self._processing_manual_input = False
         total = payload["total"]
         success = payload["success"]
         failed: list[tuple[str, str]] = payload["failed"]
@@ -482,6 +655,7 @@ class GoshuinScanApp:
 
     def _on_process_error(self, error_message: str) -> None:
         self._set_processing(False)
+        self._processing_manual_input = False
         self._append_log(f"処理失敗: {error_message}")
         messagebox.showerror("処理失敗", error_message)
 
