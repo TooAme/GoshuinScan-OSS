@@ -11,7 +11,10 @@ Process Goshuin photos easily using a Python GUI:
 4. **Background Removal & Ink Extraction**: Combines RMBG-2.0 foreground masking with `GoshuinSensoryExtractor` to remove Washi-like background and output transparent PNG.
 5. **Keep-Color Selection (Single Image Only)**: After selecting one image, the app extracts color bands and preselects black-ink/red-stamp-like colors by default. Toggling color blocks only affects final alpha composition and does not overwrite the input image.
 
-## Current Processing Flow
+<img width="1372" height="518" alt="PixPin_2026-04-22_09-52-11" src="https://github.com/user-attachments/assets/f0be26e0-ae4a-4d9c-b6f8-c3d89b4cca08" />
+<img width="1568" height="592" alt="PixPin_2026-04-21_18-21-27" src="https://github.com/user-attachments/assets/182fbcd5-6190-419b-a947-9861741b883c" />
+
+## Processing Flow
 ```mermaid
 sequenceDiagram
     autonumber
