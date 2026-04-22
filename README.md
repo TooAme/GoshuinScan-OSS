@@ -11,7 +11,11 @@ Python GUI を使用して御朱印の写真を処理します：
 4. **背景除去とインク抽出**：RMBG-2.0 の前景マスクと `GoshuinSensoryExtractor` を合成し、和紙背景を透過化した PNG を出力します。
 5. **保持色選択（単画像時）**：画像選択後に色域候補を抽出し、黒字・朱印に近い色を既定選択します。ユーザーが色ブロックを ON/OFF すると、最終透過時にその色域を保持できます（入力画像自体は変更しません）。
 
-## 現在の処理フロー
+<img width="1372" height="518" alt="PixPin_2026-04-22_09-52-11" src="https://github.com/user-attachments/assets/f0be26e0-ae4a-4d9c-b6f8-c3d89b4cca08" />
+<img width="1568" height="592" alt="PixPin_2026-04-21_18-21-27" src="https://github.com/user-attachments/assets/182fbcd5-6190-419b-a947-9861741b883c" />
+
+
+## 処理フロー
 ```mermaid
 sequenceDiagram
     autonumber
