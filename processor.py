@@ -15,6 +15,24 @@ from PIL import Image
 from torchvision import transforms
 from transformers import AutoModelForImageSegmentation
 
+_TURBOJPEG_LIBRARY_PATH = (
+    os.getenv("PYTURBOJPEG_LIBRARY_PATH")
+    or os.getenv("TURBOJPEG_LIB_PATH")
+    or os.getenv("TURBOJPEG")
+    or os.getenv("TURBOJPEG_LIB")
+)
+if _TURBOJPEG_LIBRARY_PATH:
+    _dll_path = Path(_TURBOJPEG_LIBRARY_PATH.strip().strip('"'))
+    if _dll_path.exists():
+        _normalized = str(_dll_path)
+        os.environ["TURBOJPEG"] = _normalized
+        os.environ["TURBOJPEG_LIB"] = _normalized
+        _bin_dir = str(_dll_path.parent)
+        _current_path = os.environ.get("PATH", "")
+        _path_items = _current_path.split(os.pathsep) if _current_path else []
+        if _bin_dir not in _path_items:
+            os.environ["PATH"] = f"{_bin_dir}{os.pathsep}{_current_path}" if _current_path else _bin_dir
+
 try:
     from paddleocr import TextImageUnwarping
 
@@ -32,6 +50,14 @@ except Exception as exc:  # pragma: no cover - runtime dependency check
     DocumentFile = None
     ocr_predictor = None
     _DOCTR_IMPORT_ERROR = exc
+
+try:
+    from docaligner import DocAligner
+
+    _DOCALIGNER_IMPORT_ERROR: Optional[Exception] = None
+except Exception as exc:  # pragma: no cover - runtime dependency check
+    DocAligner = None
+    _DOCALIGNER_IMPORT_ERROR = exc
 
 
 @dataclass
@@ -286,6 +312,7 @@ class GoshuinProcessor:
         self._log_callback = log_callback or (lambda _msg: None)
 
         self._doctr_predictor = None
+        self._docaligner_model = None
         self._uvdoc_model = None
         self._rmbg_model = None
         self._rmbg_transform = transforms.Compose(
@@ -317,21 +344,8 @@ class GoshuinProcessor:
             if source is None:
                 raise ValueError(f"画像を読み込めません: {image_path}")
 
-        self._log("ステップ 1/3: UVDoc 幾何補正")
-        try:
-            source = self._uvdoc_geometric_correction(source)
-            self._log("UVDoc による幾何補正が完了しました。")
-        except Exception as exc:
-            details = self._collect_exception_text(exc)
-            hint = self._build_uvdoc_hint(details)
-            if hint:
-                details = f"{details}\n{hint}"
-            self._log(
-                "UVDoc 補正に失敗したため、従来の RMBG パース補正にフォールバックします。\n"
-                f"詳細: {details}"
-            )
-            initial_mask = self._predict_foreground_mask(source)
-            source = self._perspective_correction(source, initial_mask)
+        self._log("ステップ 1/3: 幾何補正 (DocAligner -> UVDoc)")
+        source = self._geometric_correction(source)
 
         self._log("ステップ 2/3: docTR ドキュメント補正")
         enhanced = self._doctr_document_enhancement(source)
@@ -364,6 +378,245 @@ class GoshuinProcessor:
 
     def _log(self, message: str) -> None:
         self._log_callback(message)
+
+    @staticmethod
+    def _env_flag(name: str, default: bool) -> bool:
+        value = os.getenv(name)
+        if value is None:
+            return default
+        lowered = value.strip().lower()
+        if lowered in {"1", "true", "yes", "on"}:
+            return True
+        if lowered in {"0", "false", "no", "off"}:
+            return False
+        return default
+
+    @staticmethod
+    def _env_float(name: str, default: float) -> float:
+        value = os.getenv(name)
+        if value is None:
+            return default
+        try:
+            return float(value.strip())
+        except Exception:
+            return default
+
+    def _load_docaligner_model(self):
+        if self._docaligner_model is not None:
+            return self._docaligner_model
+        if DocAligner is None:
+            import_error_text = str(_DOCALIGNER_IMPORT_ERROR) if _DOCALIGNER_IMPORT_ERROR else "不明な import エラー"
+            raise RuntimeError(
+                "DocAligner が利用できません。\n"
+                f"原因: {import_error_text}\n"
+                "対処: `pip install docaligner-docsaid` を実行してください。"
+            ) from _DOCALIGNER_IMPORT_ERROR
+
+        model = None
+        last_exc: Optional[Exception] = None
+
+        model_options: list[dict[str, Any]] = []
+        if self.device == "cuda":
+            try:
+                import capybara as cb  # type: ignore
+
+                model_options.append({"backend": cb.Backend.cuda, "gpu_id": 0})
+            except Exception:
+                # Keep running even if capybara backend enum cannot be imported.
+                pass
+        model_options.extend([{}, {"gpu_id": 0}])
+
+        for kwargs in model_options:
+            try:
+                model = DocAligner(**kwargs)
+                break
+            except TypeError as exc:
+                last_exc = exc
+                continue
+            except Exception as exc:
+                last_exc = exc
+                if "device" in kwargs:
+                    continue
+                raise
+
+        if model is None:
+            details = self._collect_exception_text(last_exc) if last_exc else "不明な初期化エラー"
+            raise RuntimeError(f"DocAligner モデルの初期化に失敗しました。詳細: {details}") from last_exc
+
+        self._docaligner_model = model
+        return model
+
+    @staticmethod
+    def _order_quad_points(points: np.ndarray) -> np.ndarray:
+        rect_pts = np.zeros((4, 2), dtype=np.float32)
+        s = points.sum(axis=1)
+        rect_pts[0] = points[np.argmin(s)]  # top-left
+        rect_pts[2] = points[np.argmax(s)]  # bottom-right
+        diff = np.diff(points, axis=1).reshape(-1)
+        rect_pts[1] = points[np.argmin(diff)]  # top-right
+        rect_pts[3] = points[np.argmax(diff)]  # bottom-left
+        return rect_pts
+
+    @classmethod
+    def _warp_from_quad(cls, image: np.ndarray, points: np.ndarray) -> Optional[np.ndarray]:
+        if points.shape != (4, 2):
+            return None
+        rect_pts = cls._order_quad_points(points.astype(np.float32))
+        (tl, tr, br, bl) = rect_pts
+
+        width_a = float(np.hypot(br[0] - bl[0], br[1] - bl[1]))
+        width_b = float(np.hypot(tr[0] - tl[0], tr[1] - tl[1]))
+        max_width = max(int(width_a), int(width_b))
+
+        height_a = float(np.hypot(tr[0] - br[0], tr[1] - br[1]))
+        height_b = float(np.hypot(tl[0] - bl[0], tl[1] - bl[1]))
+        max_height = max(int(height_a), int(height_b))
+
+        if max_width < 10 or max_height < 10:
+            return None
+
+        dst = np.array(
+            [
+                [0, 0],
+                [max_width - 1, 0],
+                [max_width - 1, max_height - 1],
+                [0, max_height - 1],
+            ],
+            dtype=np.float32,
+        )
+        matrix = cv2.getPerspectiveTransform(rect_pts, dst)
+        return cv2.warpPerspective(image, matrix, (max_width, max_height))
+
+    def _extract_docaligner_corners(self, raw_data: Any) -> np.ndarray:
+        # v1.1.x returns ndarray polygon directly. Some forks may return dict/list.
+        candidate = raw_data
+        if isinstance(raw_data, list) and raw_data:
+            head = raw_data[0]
+            if isinstance(head, dict) and "corners" in head:
+                candidate = head.get("corners")
+            elif isinstance(head, (list, tuple, np.ndarray)):
+                candidate = head
+        elif isinstance(raw_data, dict):
+            if "corners" in raw_data:
+                candidate = raw_data.get("corners")
+        elif hasattr(raw_data, "corners"):
+            candidate = getattr(raw_data, "corners")
+
+        arr = np.asarray(candidate, dtype=np.float32)
+        if arr.size == 0:
+            raise RuntimeError("DocAligner が文書四角形を検出できませんでした。")
+
+        if arr.ndim == 1:
+            if arr.size % 2 != 0:
+                raise RuntimeError(f"DocAligner corners 形式が不正です: shape={arr.shape}")
+            arr = arr.reshape(-1, 2)
+        elif arr.ndim == 3 and arr.shape[-1] == 2:
+            arr = arr.reshape(-1, 2)
+        elif arr.ndim != 2 or arr.shape[1] != 2:
+            raise RuntimeError(f"DocAligner corners 形式が不正です: shape={arr.shape}")
+
+        arr = arr[np.isfinite(arr).all(axis=1)]
+        if arr.shape[0] == 0:
+            raise RuntimeError("DocAligner corners に有効な点がありません。")
+
+        if arr.shape[0] == 3:
+            # Some hard cases return only 3 corners (occlusion/cropping).
+            # Complete to 4 points via oriented rectangle so correction can continue.
+            rect = cv2.minAreaRect(arr.astype(np.float32))
+            arr = cv2.boxPoints(rect).astype(np.float32)
+            self._log("DocAligner が 3 角点のみ返したため、minAreaRect で 4 点補完しました。")
+        elif arr.shape[0] > 4:
+            rect = cv2.minAreaRect(arr.astype(np.float32))
+            arr = cv2.boxPoints(rect).astype(np.float32)
+            self._log(f"DocAligner が {arr.shape[0]} 点を返したため、minAreaRect で 4 点へ正規化しました。")
+
+        if arr.shape[0] != 4:
+            raise RuntimeError(f"DocAligner corners 形式が不正です: shape={arr.shape}")
+        if not np.isfinite(arr).all():
+            raise RuntimeError("DocAligner corners に無効な数値が含まれています。")
+        return arr
+
+    @staticmethod
+    def _extract_docaligner_score(raw_data: Any) -> Optional[float]:
+        head = raw_data[0] if isinstance(raw_data, list) and raw_data else raw_data
+        if not isinstance(head, dict):
+            return None
+        scores = head.get("scores")
+        if scores is None:
+            return None
+        arr = np.asarray(scores, dtype=np.float32).reshape(-1)
+        if arr.size == 0 or not np.isfinite(arr).all():
+            return None
+        return float(np.clip(arr.mean(), 0.0, 1.0))
+
+    def _docaligner_pre_align(self, image: np.ndarray) -> np.ndarray:
+        model = self._load_docaligner_model()
+        if hasattr(model, "predict"):
+            raw_data = model.predict(image)
+        else:
+            raw_data = model(image)
+        corners = self._extract_docaligner_corners(raw_data)
+        score = self._extract_docaligner_score(raw_data)
+
+        min_score = self._env_float("DOCALIGNER_MIN_SCORE", 0.20)
+        if score is not None and score < min_score:
+            raise RuntimeError(
+                f"DocAligner の corners 信頼度が低いためスキップします: score={score:.3f}, threshold={min_score:.3f}"
+            )
+
+        height, width = image.shape[:2]
+        corners[:, 0] = np.clip(corners[:, 0], 0, max(width - 1, 0))
+        corners[:, 1] = np.clip(corners[:, 1], 0, max(height - 1, 0))
+
+        expand_ratio = self._env_float("DOCALIGNER_EXPAND_RATIO", 0.03)
+        if expand_ratio > 0:
+            center = np.mean(corners, axis=0, keepdims=True)
+            corners = center + (corners - center) * (1.0 + float(expand_ratio))
+            corners[:, 0] = np.clip(corners[:, 0], 0, max(width - 1, 0))
+            corners[:, 1] = np.clip(corners[:, 1], 0, max(height - 1, 0))
+
+        area = float(abs(cv2.contourArea(corners.astype(np.float32))))
+        image_area = float(max(1, width * height))
+        area_ratio = area / image_area
+        min_area_ratio = self._env_float("DOCALIGNER_MIN_AREA_RATIO", 0.002)
+        if area_ratio < min_area_ratio:
+            raise RuntimeError(
+                f"DocAligner の検出領域が小さすぎます: ratio={area_ratio:.4f}, threshold={min_area_ratio:.4f}"
+            )
+
+        warped = self._warp_from_quad(image, corners)
+        if warped is None:
+            raise RuntimeError("DocAligner corners から透視変換を作成できません。")
+
+        score_text = f"{score:.3f}" if score is not None else "n/a"
+        self._log(f"DocAligner による前置補正が完了しました。(score={score_text}, area_ratio={area_ratio:.3f})")
+        return warped
+
+    def _geometric_correction(self, image: np.ndarray) -> np.ndarray:
+        working = image
+        if self._env_flag("ENABLE_DOCALIGNER", True):
+            try:
+                working = self._docaligner_pre_align(image)
+            except Exception as exc:
+                self._log(f"DocAligner 前置補正をスキップします: {self._collect_exception_text(exc)}")
+        else:
+            self._log("DocAligner 前置補正は環境変数で無効化されています。")
+
+        try:
+            corrected = self._uvdoc_geometric_correction(working)
+            self._log("UVDoc による幾何補正が完了しました。")
+            return corrected
+        except Exception as exc:
+            details = self._collect_exception_text(exc)
+            hint = self._build_uvdoc_hint(details)
+            if hint:
+                details = f"{details}\n{hint}"
+            self._log(
+                "UVDoc 補正に失敗したため、従来の RMBG パース補正にフォールバックします。\n"
+                f"詳細: {details}"
+            )
+            initial_mask = self._predict_foreground_mask(working)
+            return self._perspective_correction(working, initial_mask)
 
     def _load_uvdoc_model(self):
         if self._uvdoc_model is not None:

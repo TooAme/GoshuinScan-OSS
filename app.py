@@ -13,12 +13,6 @@ import numpy as np
 import torch
 from PIL import Image, ImageTk
 
-from processor import (
-    GoshuinProcessor,
-    ProcessResult,
-    extract_goshuin_color_options,
-)
-
 def _load_dotenv(dotenv_path: Path) -> None:
     if not dotenv_path.exists():
         return
@@ -38,6 +32,39 @@ def _load_dotenv(dotenv_path: Path) -> None:
 
 _PROJECT_ROOT = Path(__file__).resolve().parent
 _load_dotenv(_PROJECT_ROOT / ".env")
+
+
+def _configure_turbojpeg_path() -> None:
+    configured = (
+        os.getenv("PYTURBOJPEG_LIBRARY_PATH")
+        or os.getenv("TURBOJPEG_LIB_PATH")
+        or os.getenv("TURBOJPEG")
+        or os.getenv("TURBOJPEG_LIB")
+    )
+    if not configured:
+        return
+    dll_path = Path(configured.strip().strip('"'))
+    if not dll_path.exists():
+        return
+
+    normalized = str(dll_path)
+    os.environ["TURBOJPEG"] = normalized
+    os.environ["TURBOJPEG_LIB"] = normalized
+
+    bin_dir = str(dll_path.parent)
+    current_path = os.environ.get("PATH", "")
+    path_items = current_path.split(os.pathsep) if current_path else []
+    if bin_dir not in path_items:
+        os.environ["PATH"] = f"{bin_dir}{os.pathsep}{current_path}" if current_path else bin_dir
+
+
+_configure_turbojpeg_path()
+
+from processor import (
+    GoshuinProcessor,
+    ProcessResult,
+    extract_goshuin_color_options,
+)
 
 # LoRA モデルのパス設定 (.env で上書き可能)
 _LORA_MODEL_PATH = os.getenv("LORA_MODEL_PATH")
@@ -129,7 +156,7 @@ class GoshuinScanApp:
 
         subtitle = ttk.Label(
             left_panel,
-            text="処理フロー: UVDoc 幾何補正 -> docTR 補正 -> 背景除去",
+            text="処理フロー: DocAligner+UVDoc 幾何補正 -> docTR 補正 -> 背景除去",
         )
         subtitle.pack(anchor=tk.W, pady=(2, 10))
 

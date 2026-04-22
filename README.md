@@ -6,7 +6,7 @@
 ## 機能
 Python GUI を使用して御朱印の写真を処理します：
 1. **単画像 / フォルダー一括処理**：1 枚の画像または画像フォルダーを入力として選択でき、フォルダー選択時は中の対応画像を自動でまとめて処理します。
-2. **幾何補正（UVDoc）**：PaddleOCR の UVDoc モジュールを使用して、撮影時の傾き・パース歪みを補正します（失敗時は従来の RMBG ベース補正にフォールバック）。
+2. **幾何補正（DocAligner + UVDoc）**：まず DocAligner で文書領域の四角形を推定して前置補正し、続いて UVDoc で微細な歪みを補正します（失敗時は従来の RMBG ベース補正にフォールバック）。
 3. **ドキュメント補正**：docTR と古典的な画像補正アルゴリズム（CLAHE およびシャープネス）を組み合わせ、残りの微小な傾きを修正し、コントラストを強化します。
 4. **背景除去とインク抽出**：RMBG-2.0 の前景マスクと `GoshuinSensoryExtractor` を合成し、和紙背景を透過化した PNG を出力します。
 5. **保持色選択（単画像時）**：画像選択後に色域候補を抽出し、黒字・朱印に近い色を既定選択します。ユーザーが色ブロックを ON/OFF すると、最終透過時にその色域を保持できます（入力画像自体は変更しません）。
@@ -19,6 +19,7 @@ sequenceDiagram
     participant U as ユーザー (GUI)
     participant A as app.py
     participant P as processor.py (GoshuinProcessor)
+    participant DA as DocAligner
     participant UV as UVDoc (PaddleOCR)
     participant DT as docTR
     participant RB as RMBG-2.0
@@ -39,6 +40,13 @@ sequenceDiagram
     A->>P: process(image_path, output_dir, color_options, selected_color_ids)
 
     loop 画像ごと
+        P->>DA: 文書四角形を推定して前置補正
+        alt DocAligner 成功
+            DA-->>P: pre-aligned image
+        else DocAligner 失敗 / 無効
+            P->>P: 元画像のまま続行
+        end
+
         P->>UV: 幾何補正を実行
         alt UVDoc 成功
             UV-->>P: 補正済み画像
@@ -90,6 +98,31 @@ pip install -r requirements.txt
 ## PaddlePaddle (UVDoc 実行に必須)
 `paddleocr` に加えて `paddlepaddle` / `paddlepaddle-gpu` の導入が必要です。
 
+## DocAligner (推奨)
+第一段の幾何補正強化のため `docaligner` を追加しています。既定で有効です。
+
+```powershell
+python -m pip install docaligner-docsaid
+python -m pip install onnxruntime
+```
+
+そして、https://sourceforge.net/projects/libjpeg-turbo/　からlibjpeg-turboをインストールしてください。
+```powershell
+pip install PyTurboJPEG
+```
+
+`PyTurboJPEG` が DLL を自動検出できない場合は、`.env` の `PYTURBOJPEG_LIBRARY_PATH` に
+`libturbojpeg.dll` の絶対パスを設定してください（起動時に自動適用されます）。
+
+必要に応じて以下で挙動を調整できます:
+
+```powershell
+$env:ENABLE_DOCALIGNER = "1"          # 0 で無効化
+$env:DOCALIGNER_MIN_SCORE = "0.20"    # corners 平均信頼度の下限
+$env:DOCALIGNER_MIN_AREA_RATIO = "0.002"  # 検出四角形の最小面積比
+$env:DOCALIGNER_EXPAND_RATIO = "0.03" # 四角形を外側へ拡張して切れを緩和
+```
+
 例（GPU 環境）:
 
 ```powershell
@@ -122,6 +155,7 @@ Copy-Item .env.example .env
 ```env
 LORA_MODEL_PATH=K:\Qwen3-VL-4B-Instruct
 LORA_ADAPTER_PATH=K:\qwen3vl-train\output\goshuin_lora_v1
+PYTURBOJPEG_LIBRARY_PATH=C:\libjpeg-turbo-gcc64\bin\libturbojpeg.dll
 ```
 
 ## Hugging Face 認証 (RMBG-2.0 の利用に必須)
@@ -160,5 +194,5 @@ $env:RMBG_MODEL_ID = "briaai/RMBG-1.4"
 対応拡張子: `.jpg .jpeg .png .bmp .webp .tif .tiff`
 
 処理が完了すると、指定した出力ディレクトリに以下のファイルが生成されます：
-- `*_enhanced_doctr.png`：UVDoc 幾何補正 + docTR 補正済みの画像
+- `*_enhanced_doctr.png`：DocAligner + UVDoc 幾何補正 + docTR 補正済みの画像
 - `*_ink_stamp_transparent.png`：墨/印抽出結果の透過背景 PNG（保持色選択がある場合は該当色域も保持）
