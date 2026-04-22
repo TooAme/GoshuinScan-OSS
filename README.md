@@ -121,6 +121,12 @@ $env:ENABLE_DOCALIGNER = "1"          # 0 で無効化
 $env:DOCALIGNER_MIN_SCORE = "0.20"    # corners 平均信頼度の下限
 $env:DOCALIGNER_MIN_AREA_RATIO = "0.002"  # 検出四角形の最小面積比
 $env:DOCALIGNER_EXPAND_RATIO = "0.03" # 四角形を外側へ拡張して切れを緩和
+$env:DOCALIGNER_ENABLE_MASK_GUIDED_REPAIR = "1" # 2/3点検出を RMBG 輪郭融合で補完（既定: 1）
+$env:DOCALIGNER_REPAIR_BLEND_RATIO = "0.72"     # 融合時の DocAligner 点重み
+$env:DOCALIGNER_REPAIR_MAX_SNAP_RATIO = "0.45"  # 輪郭と点の許容ズレ率
+$env:DOCALIGNER_REPAIR_MIN_AREA_RATIO = "0.02"  # 補完に使う輪郭の最小面積比
+$env:DOCALIGNER_ENABLE_MINAREARECT_REPAIR = "0" # 3点/多点時の minAreaRect 補完（既定: 0）
+$env:DOCALIGNER_REJECT_LOW_INFO_RESULT = "1"    # 単色化した補正結果を自動破棄（既定: 1）
 ```
 
 例（GPU 環境）:

@@ -160,6 +160,12 @@ $env:ENABLE_DOCALIGNER = "1"          # set 0 to disable
 $env:DOCALIGNER_MIN_SCORE = "0.20"    # minimum mean corner confidence
 $env:DOCALIGNER_MIN_AREA_RATIO = "0.002"  # minimum detected quad area ratio
 $env:DOCALIGNER_EXPAND_RATIO = "0.03" # outward expansion to reduce edge clipping
+$env:DOCALIGNER_ENABLE_MASK_GUIDED_REPAIR = "1" # repair 2/3-point detections by RMBG contour fusion (default: 1)
+$env:DOCALIGNER_REPAIR_BLEND_RATIO = "0.72"     # DocAligner point weight during fusion
+$env:DOCALIGNER_REPAIR_MAX_SNAP_RATIO = "0.45"  # max allowed point-to-quad offset ratio
+$env:DOCALIGNER_REPAIR_MIN_AREA_RATIO = "0.02"  # minimum contour area ratio for repair source
+$env:DOCALIGNER_ENABLE_MINAREARECT_REPAIR = "0" # minAreaRect repair for 3+/incomplete points (default: 0)
+$env:DOCALIGNER_REJECT_LOW_INFO_RESULT = "1"    # auto-reject near-monochrome warped result (default: 1)
 ```
 
 Example (GPU):

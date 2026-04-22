@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+import itertools
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -487,7 +488,8 @@ class GoshuinProcessor:
         matrix = cv2.getPerspectiveTransform(rect_pts, dst)
         return cv2.warpPerspective(image, matrix, (max_width, max_height))
 
-    def _extract_docaligner_corners(self, raw_data: Any) -> np.ndarray:
+    @staticmethod
+    def _extract_docaligner_points_loose(raw_data: Any) -> np.ndarray:
         # v1.1.x returns ndarray polygon directly. Some forks may return dict/list.
         candidate = raw_data
         if isinstance(raw_data, list) and raw_data:
@@ -518,23 +520,140 @@ class GoshuinProcessor:
         arr = arr[np.isfinite(arr).all(axis=1)]
         if arr.shape[0] == 0:
             raise RuntimeError("DocAligner corners に有効な点がありません。")
+        return arr
 
-        if arr.shape[0] == 3:
-            # Some hard cases return only 3 corners (occlusion/cropping).
-            # Complete to 4 points via oriented rectangle so correction can continue.
-            rect = cv2.minAreaRect(arr.astype(np.float32))
-            arr = cv2.boxPoints(rect).astype(np.float32)
-            self._log("DocAligner が 3 角点のみ返したため、minAreaRect で 4 点補完しました。")
+    def _extract_docaligner_corners(self, raw_data: Any) -> np.ndarray:
+        arr = self._extract_docaligner_points_loose(raw_data)
+
+        allow_repair = self._env_flag("DOCALIGNER_ENABLE_MINAREARECT_REPAIR", False)
+        if arr.shape[0] in {3}:
+            if allow_repair:
+                # Optional repair for incomplete corners. Disabled by default because
+                # it may overfit to wrong regions on hard occlusion cases.
+                rect = cv2.minAreaRect(arr.astype(np.float32))
+                arr = cv2.boxPoints(rect).astype(np.float32)
+                self._log("DocAligner が 3 角点のみ返したため、minAreaRect で 4 点補完しました。")
+            else:
+                raise RuntimeError(
+                    "DocAligner corners が 3 点のみです。"
+                    "既定では minAreaRect 補完を無効化しているためスキップします。"
+                )
         elif arr.shape[0] > 4:
-            rect = cv2.minAreaRect(arr.astype(np.float32))
-            arr = cv2.boxPoints(rect).astype(np.float32)
-            self._log(f"DocAligner が {arr.shape[0]} 点を返したため、minAreaRect で 4 点へ正規化しました。")
+            if allow_repair:
+                rect = cv2.minAreaRect(arr.astype(np.float32))
+                arr = cv2.boxPoints(rect).astype(np.float32)
+                self._log(f"DocAligner が {arr.shape[0]} 点を返したため、minAreaRect で 4 点へ正規化しました。")
+            else:
+                raise RuntimeError(
+                    f"DocAligner corners 点数が多すぎます: n={arr.shape[0]}。"
+                    "既定では minAreaRect 正規化を無効化しているためスキップします。"
+                )
 
         if arr.shape[0] != 4:
             raise RuntimeError(f"DocAligner corners 形式が不正です: shape={arr.shape}")
         if not np.isfinite(arr).all():
             raise RuntimeError("DocAligner corners に無効な数値が含まれています。")
         return arr
+
+    @staticmethod
+    def _extract_quad_from_mask(mask: np.ndarray, min_area_ratio: float = 0.06) -> Optional[np.ndarray]:
+        if mask is None or mask.size == 0:
+            return None
+
+        mask_u8 = (np.clip(mask, 0.0, 1.0) * 255).astype(np.uint8)
+        kernel = np.ones((5, 5), np.uint8)
+        mask_u8 = cv2.morphologyEx(mask_u8, cv2.MORPH_CLOSE, kernel)
+        mask_u8 = cv2.morphologyEx(mask_u8, cv2.MORPH_OPEN, kernel)
+
+        contours, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return None
+
+        cnt = max(contours, key=cv2.contourArea)
+        area_ratio = float(cv2.contourArea(cnt)) / float(max(1, mask.shape[0] * mask.shape[1]))
+        if area_ratio < float(min_area_ratio):
+            return None
+
+        epsilon = 0.02 * cv2.arcLength(cnt, True)
+        approx = cv2.approxPolyDP(cnt, epsilon, True)
+        if len(approx) == 4:
+            pts = approx.reshape(4, 2).astype(np.float32)
+        else:
+            rect = cv2.minAreaRect(cnt)
+            pts = cv2.boxPoints(rect).astype(np.float32)
+        return pts
+
+    @staticmethod
+    def _match_points_to_quad(quad: np.ndarray, points: np.ndarray) -> tuple[list[int], float]:
+        n = points.shape[0]
+        best_perm: Optional[tuple[int, ...]] = None
+        best_dist = float("inf")
+        for perm in itertools.permutations(range(4), n):
+            dist = 0.0
+            for i, corner_idx in enumerate(perm):
+                dist += float(np.linalg.norm(points[i] - quad[corner_idx]))
+            if dist < best_dist:
+                best_dist = dist
+                best_perm = perm
+        if best_perm is None:
+            return ([], float("inf"))
+        return (list(best_perm), best_dist / max(1, n))
+
+    def _repair_incomplete_docaligner_corners(self, image: np.ndarray, points: np.ndarray) -> Optional[np.ndarray]:
+        if image is None or image.size == 0 or points.shape[0] < 2:
+            return None
+
+        if not self._env_flag("DOCALIGNER_ENABLE_MASK_GUIDED_REPAIR", True):
+            return None
+
+        try:
+            fg_mask = self._predict_foreground_mask(image)
+        except Exception as exc:
+            self._log(f"DocAligner 補完用の RMBG マスク生成に失敗しました: {self._collect_exception_text(exc)}")
+            return None
+
+        min_area_ratio = self._env_float("DOCALIGNER_REPAIR_MIN_AREA_RATIO", 0.02)
+        quad = self._extract_quad_from_mask(fg_mask, min_area_ratio=min_area_ratio)
+        if quad is None:
+            return None
+
+        quad = self._order_quad_points(quad.astype(np.float32))
+        pts = points.astype(np.float32)
+        assigned_corners, mean_dist = self._match_points_to_quad(quad, pts)
+
+        bbox = cv2.boundingRect(quad.astype(np.float32))
+        diag = float(np.hypot(max(1, bbox[2]), max(1, bbox[3])))
+        max_snap_ratio = self._env_float("DOCALIGNER_REPAIR_MAX_SNAP_RATIO", 0.45)
+        max_snap_dist = diag * max_snap_ratio
+        if mean_dist > max_snap_dist:
+            self._log(
+                "DocAligner 点とRMBG輪郭の整合が低いため、RMBG輪郭四角形を補完結果として採用します。"
+                f"(mean_dist={mean_dist:.1f}, limit={max_snap_dist:.1f})"
+            )
+            return quad
+
+        blend = float(np.clip(self._env_float("DOCALIGNER_REPAIR_BLEND_RATIO", 0.72), 0.0, 1.0))
+        fused = quad.copy()
+        for i, corner_idx in enumerate(assigned_corners):
+            fused[corner_idx] = fused[corner_idx] * (1.0 - blend) + pts[i] * blend
+        return fused
+
+    @staticmethod
+    def _is_low_information_warp(source: np.ndarray, warped: np.ndarray) -> bool:
+        if source is None or warped is None or source.size == 0 or warped.size == 0:
+            return True
+        src_hsv = cv2.cvtColor(source, cv2.COLOR_BGR2HSV)
+        warp_hsv = cv2.cvtColor(warped, cv2.COLOR_BGR2HSV)
+
+        src_s_mean = float(src_hsv[:, :, 1].mean())
+        src_v_std = float(src_hsv[:, :, 2].std())
+        warp_s_mean = float(warp_hsv[:, :, 1].mean())
+        warp_v_std = float(warp_hsv[:, :, 2].std())
+
+        # Detect gray/flat failure outputs (almost single-color image).
+        sat_floor = max(8.0, src_s_mean * 0.28)
+        val_floor = max(10.0, src_v_std * 0.22)
+        return (warp_s_mean < sat_floor) and (warp_v_std < val_floor)
 
     @staticmethod
     def _extract_docaligner_score(raw_data: Any) -> Optional[float]:
@@ -555,7 +674,17 @@ class GoshuinProcessor:
             raw_data = model.predict(image)
         else:
             raw_data = model(image)
-        corners = self._extract_docaligner_corners(raw_data)
+        loose_points = self._extract_docaligner_points_loose(raw_data)
+        if loose_points.shape[0] in {2, 3}:
+            repaired = self._repair_incomplete_docaligner_corners(image, loose_points)
+            if repaired is not None and repaired.shape == (4, 2):
+                corners = repaired
+                self._log(f"DocAligner の {loose_points.shape[0]} 角点検出を RMBG 輪郭融合で 4 点補完しました。")
+            else:
+                corners = self._extract_docaligner_corners(raw_data)
+        else:
+            corners = self._extract_docaligner_corners(raw_data)
+
         score = self._extract_docaligner_score(raw_data)
 
         min_score = self._env_float("DOCALIGNER_MIN_SCORE", 0.20)
@@ -587,6 +716,10 @@ class GoshuinProcessor:
         warped = self._warp_from_quad(image, corners)
         if warped is None:
             raise RuntimeError("DocAligner corners から透視変換を作成できません。")
+
+        reject_low_info = self._env_flag("DOCALIGNER_REJECT_LOW_INFO_RESULT", True)
+        if reject_low_info and self._is_low_information_warp(image, warped):
+            raise RuntimeError("DocAligner 補正結果が低情報（ほぼ単色）だったため破棄しました。")
 
         score_text = f"{score:.3f}" if score is not None else "n/a"
         self._log(f"DocAligner による前置補正が完了しました。(score={score_text}, area_ratio={area_ratio:.3f})")
